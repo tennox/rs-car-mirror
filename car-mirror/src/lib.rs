@@ -16,6 +16,11 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "test_utils")))]
 pub mod test_utils;
 
+/// A block store wrapper that buffers writes for batch storage.
+///
+/// Useful for remote-backed block stores where individual `put_block_keyed` calls
+/// are expensive (e.g., one HTTP roundtrip each). See [`BufferedBlockStore`](buffered::BufferedBlockStore).
+pub mod buffered;
 /// Module with local caching strategies and mechanisms that greatly enhance CAR mirror performance
 pub mod cache;
 /// Code that's common among the push and pull protocol sides (most of the code).
