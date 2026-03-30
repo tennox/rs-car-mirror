@@ -2,13 +2,12 @@
   description = "car-mirror";
 
   inputs = {
-    nixpkgs.url = "nixpkgs/nixos-22.11";
+    nixpkgs.url = "nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
 
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
-      inputs.flake-utils.follows = "flake-utils";
     };
   };
 
@@ -88,7 +87,7 @@
           };
 
           doCheck = false;
-          cargoSha256 = "sha256-A24O3p85mCRVZfDyyjQcQosj/4COGNnqiQK2a7nCP6I=";
+          cargoHash = "sha256-/S7fNDmaw6blM9PjB430+CQxCM4Np/N5JkoLB4BHho0=";
         };
       }
     );
