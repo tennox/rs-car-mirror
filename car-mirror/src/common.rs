@@ -1,4 +1,5 @@
 use crate::{
+    buffered::BufferedBlockStore,
     cache::Cache,
     dag_walk::DagWalk,
     error::Error,
@@ -283,6 +284,74 @@ pub async fn block_receive_block_stream(
     }
 
     Ok(dag_verification.into_receiver_state(config.bloom_fpr))
+}
+
+/// Like [`block_receive`], but returns verified blocks instead of storing them.
+///
+/// The returned `Vec<(Cid, Bytes)>` contains all blocks that were verified
+/// during this round, in the order they were received. The caller is
+/// responsible for persisting them (e.g., batch-importing as a CAR file).
+///
+/// The `store` parameter is only read from to determine which blocks are
+/// already present — no writes are made to it.
+#[tracing::instrument(skip_all, fields(root, car_bytes = last_car.as_ref().map(|car| car.bytes.len())))]
+pub async fn block_receive_with_blocks(
+    root: Cid,
+    last_car: Option<CarFile>,
+    config: &Config,
+    store: impl BlockStore,
+    cache: impl Cache,
+) -> Result<(ReceiverState, Vec<(Cid, Bytes)>), Error> {
+    let buffered = BufferedBlockStore::new(&store);
+    let mut receiver_state = match last_car {
+        Some(car) => {
+            if car.bytes.len() > config.receive_maximum {
+                return Err(Error::TooManyBytes {
+                    receive_maximum: config.receive_maximum,
+                    bytes_read: car.bytes.len(),
+                });
+            }
+
+            block_receive_car_stream(root, Cursor::new(car.bytes), config, &buffered, &cache)
+                .await?
+        }
+        None => IncrementalDagVerification::new([root], &buffered, &cache)
+            .await?
+            .into_receiver_state(config.bloom_fpr),
+    };
+
+    receiver_state
+        .missing_subgraph_roots
+        .truncate(config.max_roots_per_round);
+
+    let blocks = buffered.into_blocks();
+    Ok((receiver_state, blocks))
+}
+
+/// Like [`block_receive_car_stream`], but returns verified blocks instead of storing them.
+///
+/// See [`block_receive_with_blocks`] for details.
+#[tracing::instrument(skip_all, fields(root))]
+pub async fn block_receive_car_stream_with_blocks<R: tokio::io::AsyncRead + Unpin + CondSend>(
+    root: Cid,
+    reader: R,
+    config: &Config,
+    store: impl BlockStore,
+    cache: impl Cache,
+) -> Result<(ReceiverState, Vec<(Cid, Bytes)>), Error> {
+    let buffered = BufferedBlockStore::new(&store);
+    let reader = CarReader::new(reader).await?;
+
+    let mut stream: BlockStream<'_> = Box::pin(
+        reader
+            .stream()
+            .map_ok(|(cid, bytes)| (cid, Bytes::from(bytes)))
+            .map_err(Error::CarFileError),
+    );
+
+    let state = block_receive_block_stream(root, &mut stream, config, &buffered, &cache).await?;
+    let blocks = buffered.into_blocks();
+    Ok((state, blocks))
 }
 
 /// Turns a stream of blocks (tuples of CIDs and Bytes) into a stream

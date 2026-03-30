@@ -1,12 +1,14 @@
 use crate::{
     cache::Cache,
     common::{
-        block_receive, block_receive_car_stream, block_send, block_send_block_stream,
-        stream_car_frames, CarFile, CarStream, Config, ReceiverState,
+        block_receive, block_receive_car_stream, block_receive_car_stream_with_blocks,
+        block_receive_with_blocks, block_send, block_send_block_stream, stream_car_frames,
+        CarFile, CarStream, Config, ReceiverState,
     },
     error::Error,
     messages::PushResponse,
 };
+use bytes::Bytes;
 use libipld_core::cid::Cid;
 use wnfs_common::{utils::CondSend, BlockStore};
 
@@ -66,6 +68,38 @@ pub async fn response(
     Ok(block_receive(root, Some(request), config, store, cache)
         .await?
         .into())
+}
+
+/// Like [`response`], but returns the verified blocks instead of storing them.
+///
+/// The `store` is only read from to determine which blocks are already present.
+/// The returned `Vec<(Cid, Bytes)>` contains all new blocks, letting the caller
+/// persist them in bulk (e.g., re-assembling a CAR for `dag/import`).
+pub async fn response_with_blocks(
+    root: Cid,
+    request: CarFile,
+    config: &Config,
+    store: impl BlockStore,
+    cache: impl Cache,
+) -> Result<(PushResponse, Vec<(Cid, Bytes)>), Error> {
+    let (state, blocks) =
+        block_receive_with_blocks(root, Some(request), config, store, cache).await?;
+    Ok((state.into(), blocks))
+}
+
+/// Like [`response_streaming`], but returns the verified blocks instead of storing them.
+///
+/// See [`response_with_blocks`] for details.
+pub async fn response_streaming_with_blocks(
+    root: Cid,
+    request: impl tokio::io::AsyncRead + Unpin + CondSend,
+    config: &Config,
+    store: impl BlockStore,
+    cache: impl Cache,
+) -> Result<(PushResponse, Vec<(Cid, Bytes)>), Error> {
+    let (state, blocks) =
+        block_receive_car_stream_with_blocks(root, request, config, store, cache).await?;
+    Ok((state.into(), blocks))
 }
 
 /// Respond to a push request on the "server" side in a streaming fashing
@@ -256,6 +290,47 @@ mod tests {
             "Average network overhead: {}%",
             (total_network_bytes as f64 / total_block_bytes as f64 - 1.0) * 100.0
         );
+
+        Ok(())
+    }
+
+    #[test_log::test(async_std::test)]
+    async fn test_transfer_with_blocks() -> TestResult {
+        let (root, ref client_store) = setup_random_dag(256, 10 * 1024).await?;
+        let server_store = &MemoryBlockStore::new();
+        let config = &Config::default();
+
+        let mut car_file = push::request(root, None, config, client_store, &NoCache).await?;
+        loop {
+            // Use response_with_blocks: server_store is read-only, blocks come back to us
+            let (response, blocks) =
+                push::response_with_blocks(root, car_file, config, server_store, &NoCache).await?;
+
+            // Batch-store all blocks at once (simulates a single dag/import call)
+            for (cid, bytes) in blocks {
+                server_store.put_block_keyed(cid, bytes).await?;
+            }
+
+            if response.indicates_finished() {
+                break;
+            }
+            car_file =
+                push::request(root, Some(response), config, client_store, &NoCache).await?;
+        }
+
+        // Verify complete transfer
+        let client_cids = DagWalk::breadth_first([root])
+            .stream(client_store, &NoCache)
+            .and_then(|item| async move { item.to_cid() })
+            .try_collect::<HashSet<_>>()
+            .await?;
+        let server_cids = DagWalk::breadth_first([root])
+            .stream(server_store, &NoCache)
+            .and_then(|item| async move { item.to_cid() })
+            .try_collect::<HashSet<_>>()
+            .await?;
+
+        assert_eq!(client_cids, server_cids);
 
         Ok(())
     }

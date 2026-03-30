@@ -1,12 +1,14 @@
 use crate::{
     cache::Cache,
     common::{
-        block_receive, block_receive_car_stream, block_send, block_send_block_stream,
-        stream_car_frames, CarFile, CarStream, Config, ReceiverState,
+        block_receive, block_receive_car_stream, block_receive_car_stream_with_blocks,
+        block_receive_with_blocks, block_send, block_send_block_stream, stream_car_frames,
+        CarFile, CarStream, Config, ReceiverState,
     },
     error::Error,
     messages::PullRequest,
 };
+use bytes::Bytes;
 use libipld::Cid;
 use tokio::io::AsyncRead;
 use wnfs_common::{utils::CondSend, BlockStore};
@@ -49,6 +51,38 @@ pub async fn handle_response_streaming(
     Ok(block_receive_car_stream(root, stream, config, store, cache)
         .await?
         .into())
+}
+
+/// Like [`request`], but returns verified blocks instead of storing them.
+///
+/// The `store` is only read from to determine which blocks are already present.
+/// The returned `Vec<(Cid, Bytes)>` contains all new blocks, letting the caller
+/// persist them in bulk.
+pub async fn request_with_blocks(
+    root: Cid,
+    last_response: Option<CarFile>,
+    config: &Config,
+    store: impl BlockStore,
+    cache: impl Cache,
+) -> Result<(PullRequest, Vec<(Cid, Bytes)>), Error> {
+    let (state, blocks) =
+        block_receive_with_blocks(root, last_response, config, store, cache).await?;
+    Ok((state.into(), blocks))
+}
+
+/// Like [`handle_response_streaming`], but returns verified blocks instead of storing them.
+///
+/// See [`request_with_blocks`] for details.
+pub async fn handle_response_streaming_with_blocks(
+    root: Cid,
+    stream: impl AsyncRead + Unpin + CondSend,
+    config: &Config,
+    store: impl BlockStore,
+    cache: impl Cache,
+) -> Result<(PullRequest, Vec<(Cid, Bytes)>), Error> {
+    let (state, blocks) =
+        block_receive_car_stream_with_blocks(root, stream, config, store, cache).await?;
+    Ok((state.into(), blocks))
 }
 
 /// Respond to a CAR mirror pull request on the "server" side.
@@ -175,6 +209,48 @@ mod tests {
             )
             .await?;
         }
+
+        Ok(())
+    }
+
+    #[test_log::test(async_std::test)]
+    async fn test_transfer_with_blocks() -> TestResult {
+        let client_store = &MemoryBlockStore::new();
+        let (root, ref server_store) = setup_random_dag(256, 10 * 1024).await?;
+        let config = &Config::default();
+
+        let mut last_car = None;
+        loop {
+            // Use request_with_blocks: client_store is read-only, blocks come back to us
+            let (request, blocks) =
+                pull::request_with_blocks(root, last_car, config, client_store, &NoCache).await?;
+
+            // Batch-store all received blocks at once
+            for (cid, bytes) in blocks {
+                client_store.put_block_keyed(cid, bytes).await?;
+            }
+
+            if request.indicates_finished() {
+                break;
+            }
+
+            last_car =
+                Some(pull::response(root, request, config, server_store, NoCache).await?);
+        }
+
+        // Verify complete transfer
+        let client_cids = DagWalk::breadth_first([root])
+            .stream(client_store, &NoCache)
+            .and_then(|item| async move { item.to_cid() })
+            .try_collect::<HashSet<_>>()
+            .await?;
+        let server_cids = DagWalk::breadth_first([root])
+            .stream(server_store, &NoCache)
+            .and_then(|item| async move { item.to_cid() })
+            .try_collect::<HashSet<_>>()
+            .await?;
+
+        assert_eq!(client_cids, server_cids);
 
         Ok(())
     }
