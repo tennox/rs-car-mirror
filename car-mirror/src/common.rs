@@ -165,9 +165,14 @@ pub async fn block_send_block_stream<'a>(
         have_cids_bloom: None,
     });
 
-    // Verify that all missing subgraph roots are in the relevant DAG:
-    let subgraph_roots =
-        verify_missing_subgraph_roots(root, &missing_subgraph_roots, &store, &cache).await?;
+    // Verify that all missing subgraph roots are in the relevant DAG.
+    // Short-circuit: if the only root requested is the DAG root itself,
+    // it's trivially valid — skip the expensive full-DAG walk.
+    let subgraph_roots = if missing_subgraph_roots == [root] {
+        missing_subgraph_roots
+    } else {
+        verify_missing_subgraph_roots(root, &missing_subgraph_roots, &store, &cache).await?
+    };
 
     let bloom = handle_missing_bloom(have_cids_bloom);
 
