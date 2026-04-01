@@ -1,6 +1,6 @@
 use crate::{
     cache::Cache,
-    common::ReceiverState,
+    common::{self, ReceiverState},
     dag_walk::{DagWalk, TraversedItem},
     error::{Error, IncrementalVerificationError},
 };
@@ -128,7 +128,7 @@ impl IncrementalDagVerification {
         &mut self,
         block: (Cid, Bytes),
         store: &impl BlockStore,
-        cache: &impl Cache,
+        _cache: &impl Cache,
     ) -> Result<(), Error> {
         let (cid, bytes) = block;
 
@@ -159,11 +159,22 @@ impl IncrementalDagVerification {
         }
 
         store
-            .put_block_keyed(cid, bytes)
+            .put_block_keyed(cid, bytes.clone())
             .await
             .map_err(Error::BlockStoreError)?;
 
-        self.update_have_cids(store, cache).await?;
+        // Incrementally update state: mark this CID as "have" and add
+        // its direct links as "want" (if not already known).
+        // This is O(links_in_block) per block instead of a full DAG walk.
+        self.want_cids.remove(&cid);
+        self.have_cids.insert(cid);
+
+        let refs = common::references(cid, &bytes, Vec::new()).map_err(Error::ParsingError)?;
+        for ref_cid in refs {
+            if !self.have_cids.contains(&ref_cid) {
+                self.want_cids.insert(ref_cid);
+            }
+        }
 
         Ok(())
     }

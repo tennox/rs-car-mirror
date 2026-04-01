@@ -12,7 +12,7 @@ use futures::{StreamExt, TryStreamExt};
 use iroh_car::{CarHeader, CarReader, CarWriter};
 use libipld::{Ipld, IpldCodec};
 use libipld_core::{cid::Cid, codec::References};
-use std::io::Cursor;
+use std::{collections::HashSet, io::Cursor};
 use wnfs_common::{
     utils::{boxed_stream, BoxStream, CondSend},
     BlockStore,
@@ -288,6 +288,9 @@ pub async fn block_receive_block_stream(
         }
     }
 
+    // No full DAG walk needed here — verify_and_store_block incrementally
+    // updates want_cids/have_cids by extracting direct links from each block.
+
     Ok(dag_verification.into_receiver_state(config.bloom_fpr))
 }
 
@@ -442,19 +445,24 @@ async fn verify_missing_subgraph_roots(
     store: &impl BlockStore,
     cache: &impl Cache,
 ) -> Result<Vec<Cid>, Error> {
+    let missing_set: HashSet<Cid> = missing_subgraph_roots.iter().cloned().collect();
     let subgraph_roots: Vec<Cid> = DagWalk::breadth_first([root])
         .stream(store, cache)
-        .try_filter_map(|item| async move {
-            let cid = item.to_cid()?;
-            Ok(missing_subgraph_roots.contains(&cid).then_some(cid))
+        .try_filter_map(|item| {
+            let missing_set = &missing_set;
+            async move {
+                let cid = item.to_cid()?;
+                Ok(missing_set.contains(&cid).then_some(cid))
+            }
         })
         .try_collect()
         .await?;
 
     if subgraph_roots.len() != missing_subgraph_roots.len() {
+        let subgraph_set: HashSet<&Cid> = subgraph_roots.iter().collect();
         let unrelated_roots = missing_subgraph_roots
             .iter()
-            .filter(|cid| !subgraph_roots.contains(cid))
+            .filter(|cid| !subgraph_set.contains(cid))
             .map(|cid| cid.to_string())
             .collect::<Vec<_>>()
             .join(", ");
@@ -488,13 +496,14 @@ fn stream_blocks_from_roots<'a>(
     store: impl BlockStore + 'a,
     cache: impl Cache + 'a,
 ) -> BlockStream<'a> {
+    let subgraph_roots_set: HashSet<Cid> = subgraph_roots.iter().cloned().collect();
     Box::pin(async_stream::try_stream! {
         let mut dag_walk = DagWalk::breadth_first(subgraph_roots.clone());
 
         while let Some(item) = dag_walk.next(&store, &cache).await? {
             let cid = item.to_cid()?;
 
-            if should_block_be_skipped(&cid, &bloom, &subgraph_roots) {
+            if should_block_be_skipped(&cid, &bloom, &subgraph_roots_set) {
                 continue;
             }
 
@@ -552,7 +561,7 @@ async fn write_blocks_into_car<W: tokio::io::AsyncWrite + Unpin + Send>(
     Ok(writer.finish().await?)
 }
 
-fn should_block_be_skipped(cid: &Cid, bloom: &BloomFilter, subgraph_roots: &[Cid]) -> bool {
+fn should_block_be_skipped(cid: &Cid, bloom: &BloomFilter, subgraph_roots: &HashSet<Cid>) -> bool {
     bloom.contains(&cid.to_bytes()) && !subgraph_roots.contains(cid)
 }
 
