@@ -61,6 +61,31 @@ pub struct Config {
     /// one order of magnitude under the number of elements. E.g. for 100_000 elements,
     /// a false positive probability of 1 in 1 million.
     pub bloom_fpr: fn(u64) -> f64,
+    /// Roots of subgraphs that are known to be *completely* present on the
+    /// block-receiving side (application invariant — e.g. wovin snapshot roots,
+    /// which are only ever recorded/pinned as complete DAGs).
+    ///
+    /// Used during incremental verification: traversal stops at these CIDs
+    /// instead of walking the entire (append-only) history below them, making
+    /// verification cost proportional to the new data instead of the full DAG.
+    ///
+    /// This is per-transfer state more than static configuration — clone the
+    /// base config and fill this in per request. Empty by default (no effect).
+    pub complete_subgraph_roots: HashSet<Cid>,
+    /// Assume that when the receiver's bloom filter contains a CID, the
+    /// receiver has that block's *entire subgraph*, and prune the send-side
+    /// traversal below it (instead of walking every block of shared history
+    /// just to skip each one individually).
+    ///
+    /// This is NOT generally true in car-mirror (a bloom describes a flat set
+    /// of blocks), but holds for append-only snapshot-chain DAGs like wovin's,
+    /// where a receiver only records a snapshot root once it has its full DAG.
+    ///
+    /// Self-healing: a bloom false positive can prune too much, but the
+    /// receiver then explicitly requests the missing subgraph roots in the next
+    /// round, and explicitly requested roots always bypass the bloom.
+    /// Off by default.
+    pub bloom_implies_complete_subgraphs: bool,
 }
 
 impl Default for Config {
@@ -70,6 +95,8 @@ impl Default for Config {
             max_block_size: 1_000_000,  // 1 MB
             max_roots_per_round: 1000,  // max. ~41KB of CIDs
             bloom_fpr: |num_of_elems| f64::min(0.001, 0.1 / num_of_elems as f64),
+            complete_subgraph_roots: HashSet::new(),
+            bloom_implies_complete_subgraphs: false,
         }
     }
 }
@@ -123,6 +150,7 @@ pub async fn block_send(
         last_state,
         Vec::new(),
         Some(config.receive_maximum),
+        config.bloom_implies_complete_subgraphs,
         store,
         cache,
     )
@@ -142,10 +170,13 @@ pub async fn block_send_car_stream<W: tokio::io::AsyncWrite + Unpin + Send>(
     last_state: Option<ReceiverState>,
     writer: W,
     send_limit: Option<usize>,
+    prune_bloom_subgraphs: bool,
     store: impl BlockStore,
     cache: impl Cache,
 ) -> Result<W, Error> {
-    let mut block_stream = block_send_block_stream(root, last_state, store, cache).await?;
+    let mut block_stream =
+        block_send_block_stream_pruning(root, last_state, prune_bloom_subgraphs, store, cache)
+            .await?;
     write_blocks_into_car(writer, &mut block_stream, send_limit).await
 }
 
@@ -157,6 +188,18 @@ pub async fn block_send_block_stream<'a>(
     store: impl BlockStore + 'a,
     cache: impl Cache + 'a,
 ) -> Result<BlockStream<'a>, Error> {
+    block_send_block_stream_pruning(root, last_state, false, store, cache).await
+}
+
+/// Like [`block_send_block_stream`], but with optional subgraph pruning below
+/// bloom hits (see [`Config::bloom_implies_complete_subgraphs`]).
+pub async fn block_send_block_stream_pruning<'a>(
+    root: Cid,
+    last_state: Option<ReceiverState>,
+    prune_bloom_subgraphs: bool,
+    store: impl BlockStore + 'a,
+    cache: impl Cache + 'a,
+) -> Result<BlockStream<'a>, Error> {
     let ReceiverState {
         missing_subgraph_roots,
         have_cids_bloom,
@@ -165,18 +208,27 @@ pub async fn block_send_block_stream<'a>(
         have_cids_bloom: None,
     });
 
+    let bloom = handle_missing_bloom(have_cids_bloom);
+
     // Verify that all missing subgraph roots are in the relevant DAG.
     // Short-circuit: if the only root requested is the DAG root itself,
     // it's trivially valid — skip the expensive full-DAG walk.
     let subgraph_roots = if missing_subgraph_roots == [root] {
         missing_subgraph_roots
     } else {
-        verify_missing_subgraph_roots(root, &missing_subgraph_roots, &store, &cache).await?
+        verify_missing_subgraph_roots(
+            root,
+            &missing_subgraph_roots,
+            &bloom,
+            prune_bloom_subgraphs,
+            &store,
+            &cache,
+        )
+        .await?
     };
 
-    let bloom = handle_missing_bloom(have_cids_bloom);
-
-    let stream = stream_blocks_from_roots(subgraph_roots, bloom, store, cache);
+    let stream =
+        stream_blocks_from_roots(subgraph_roots, bloom, prune_bloom_subgraphs, store, cache);
 
     Ok(Box::pin(stream))
 }
@@ -208,9 +260,14 @@ pub async fn block_receive(
 
             block_receive_car_stream(root, Cursor::new(car.bytes), config, store, cache).await?
         }
-        None => IncrementalDagVerification::new([root], &store, &cache)
-            .await?
-            .into_receiver_state(config.bloom_fpr),
+        None => IncrementalDagVerification::new_with_boundary(
+            [root],
+            config.complete_subgraph_roots.clone(),
+            &store,
+            &cache,
+        )
+        .await?
+        .into_receiver_state(config.bloom_fpr),
     };
 
     receiver_state
@@ -251,7 +308,13 @@ pub async fn block_receive_block_stream(
     cache: impl Cache,
 ) -> Result<ReceiverState, Error> {
     let max_block_size = config.max_block_size;
-    let mut dag_verification = IncrementalDagVerification::new([root], &store, &cache).await?;
+    let mut dag_verification = IncrementalDagVerification::new_with_boundary(
+        [root],
+        config.complete_subgraph_roots.clone(),
+        &store,
+        &cache,
+    )
+    .await?;
 
     while let Some((cid, block)) = stream.try_next().await? {
         let block_bytes = block.len();
@@ -323,9 +386,14 @@ pub async fn block_receive_with_blocks(
             block_receive_car_stream(root, Cursor::new(car.bytes), config, &buffered, &cache)
                 .await?
         }
-        None => IncrementalDagVerification::new([root], &buffered, &cache)
-            .await?
-            .into_receiver_state(config.bloom_fpr),
+        None => IncrementalDagVerification::new_with_boundary(
+            [root],
+            config.complete_subgraph_roots.clone(),
+            &buffered,
+            &cache,
+        )
+        .await?
+        .into_receiver_state(config.bloom_fpr),
     };
 
     receiver_state
@@ -442,21 +510,30 @@ async fn car_frame_from_block(block: (Cid, Bytes)) -> Result<Bytes, Error> {
 async fn verify_missing_subgraph_roots(
     root: Cid,
     missing_subgraph_roots: &[Cid],
+    bloom: &BloomFilter,
+    prune_bloom_subgraphs: bool,
     store: &impl BlockStore,
     cache: &impl Cache,
 ) -> Result<Vec<Cid>, Error> {
     let missing_set: HashSet<Cid> = missing_subgraph_roots.iter().cloned().collect();
-    let subgraph_roots: Vec<Cid> = DagWalk::breadth_first([root])
-        .stream(store, cache)
-        .try_filter_map(|item| {
-            let missing_set = &missing_set;
-            async move {
-                let cid = item.to_cid()?;
-                Ok(missing_set.contains(&cid).then_some(cid))
-            }
-        })
-        .try_collect()
-        .await?;
+    let mut subgraph_roots: Vec<Cid> = Vec::new();
+    let mut dag_walk = DagWalk::breadth_first([root]);
+
+    while let Some(item) = dag_walk.next(store, cache).await? {
+        let cid = item.to_cid()?;
+
+        if missing_set.contains(&cid) {
+            subgraph_roots.push(cid);
+            continue;
+        }
+
+        // If the receiver has this block (bloom hit) and its subgraph is
+        // implied complete, don't walk below it — but never prune away CIDs
+        // the receiver explicitly asked for (they're always valid to request).
+        if prune_bloom_subgraphs && bloom.contains(&cid.to_bytes()) {
+            prune_frontier_below(&mut dag_walk, cid, &missing_set, store, cache).await?;
+        }
+    }
 
     if subgraph_roots.len() != missing_subgraph_roots.len() {
         let subgraph_set: HashSet<&Cid> = subgraph_roots.iter().collect();
@@ -493,6 +570,7 @@ fn handle_missing_bloom(have_cids_bloom: Option<BloomFilter>) -> BloomFilter {
 fn stream_blocks_from_roots<'a>(
     subgraph_roots: Vec<Cid>,
     bloom: BloomFilter,
+    prune_bloom_subgraphs: bool,
     store: impl BlockStore + 'a,
     cache: impl Cache + 'a,
 ) -> BlockStream<'a> {
@@ -504,6 +582,12 @@ fn stream_blocks_from_roots<'a>(
             let cid = item.to_cid()?;
 
             if should_block_be_skipped(&cid, &bloom, &subgraph_roots_set) {
+                if prune_bloom_subgraphs {
+                    // Receiver has this block, and with the complete-subgraph
+                    // invariant it has everything below it too — stop walking
+                    // (but never prune explicitly requested roots).
+                    prune_frontier_below(&mut dag_walk, cid, &subgraph_roots_set, &store, &cache).await?;
+                }
                 continue;
             }
 
@@ -512,6 +596,30 @@ fn stream_blocks_from_roots<'a>(
             yield (cid, bytes);
         }
     })
+}
+
+/// Remove `cid`'s direct references from the walk frontier (they were just
+/// enqueued by `dag_walk.next`), keeping any CIDs in `protected`.
+///
+/// Used when the receiver is known to have `cid`'s complete subgraph
+/// (see [`Config::bloom_implies_complete_subgraphs`]).
+async fn prune_frontier_below(
+    dag_walk: &mut DagWalk,
+    cid: Cid,
+    protected: &HashSet<Cid>,
+    store: &impl BlockStore,
+    cache: &impl Cache,
+) -> Result<(), Error> {
+    let refs: HashSet<Cid> = cache
+        .references(cid, store)
+        .await
+        .map_err(Error::BlockStoreError)?
+        .into_iter()
+        .collect();
+    dag_walk
+        .frontier
+        .retain(|c| protected.contains(c) || !refs.contains(c));
+    Ok(())
 }
 
 async fn write_blocks_into_car<W: tokio::io::AsyncWrite + Unpin + Send>(
@@ -798,6 +906,212 @@ pub(crate) mod tests {
         .await;
 
         assert_matches!(result, Err(Error::BlockSizeExceeded { .. }));
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wovin_chain_tests {
+    //! Tests for the wovin-style DAG optimizations:
+    //! append-only chains of snapshots (root → applog chunk → many small
+    //! leaves, root → prev snapshot root), where a receiver that has a
+    //! snapshot root always has its complete subgraph.
+
+    use super::*;
+    use crate::{cache::NoCache, pull, push};
+    use libipld::{cbor::DagCborCodec, Ipld};
+    use std::collections::BTreeMap;
+    use testresult::TestResult;
+    use wnfs_common::{encode, MemoryBlockStore};
+
+    /// Store one wovin-style snapshot: root → chunk → `leaf_count` leaves,
+    /// plus `prev` link on the root if given. Content is deterministic per
+    /// `tag`, so building the same snapshot into two stores yields equal CIDs.
+    /// Returns (root, number of blocks in this snapshot).
+    async fn put_snapshot(
+        store: &impl BlockStore,
+        prev: Option<Cid>,
+        leaf_count: usize,
+        tag: &str,
+    ) -> anyhow::Result<(Cid, usize)> {
+        let mut leaves = Vec::new();
+        for i in 0..leaf_count {
+            let cid = store
+                .put_block(
+                    encode(&Ipld::String(format!("leaf-{tag}-{i}")), DagCborCodec)?,
+                    DagCborCodec.into(),
+                )
+                .await?;
+            leaves.push(Ipld::Link(cid));
+        }
+        let chunk_cid = store
+            .put_block(
+                encode(&Ipld::List(leaves), DagCborCodec)?,
+                DagCborCodec.into(),
+            )
+            .await?;
+        let mut map = BTreeMap::new();
+        map.insert("applogs".to_string(), Ipld::Link(chunk_cid));
+        if let Some(prev) = prev {
+            map.insert("prev".to_string(), Ipld::Link(prev));
+        }
+        let root = store
+            .put_block(encode(&Ipld::Map(map), DagCborCodec)?, DagCborCodec.into())
+            .await?;
+        Ok((root, leaf_count + 2))
+    }
+
+    async fn count_car_blocks(car: &CarFile) -> anyhow::Result<usize> {
+        let reader = CarReader::new(Cursor::new(car.bytes.clone())).await?;
+        let mut count = 0;
+        let mut stream = Box::pin(reader.stream());
+        while stream.try_next().await?.is_some() {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn assert_complete_dag(root: Cid, store: &impl BlockStore) -> TestResult {
+        DagWalk::breadth_first([root])
+            .stream(store, &NoCache)
+            .try_for_each(|item| async move {
+                item.to_cid()?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Pull of a new snapshot when the client already has the full history:
+    /// with the client seeding its boundary and the server pruning below
+    /// bloom hits, only the delta is transferred — in a single round.
+    #[test_log::test(async_std::test)]
+    async fn test_pull_boundary_transfers_only_delta() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+        let client_store = &MemoryBlockStore::new();
+
+        // Shared history: two snapshots, fully present on both sides
+        let (snap1, _) = put_snapshot(server_store, None, 100, "s1").await?;
+        let (snap1_client, _) = put_snapshot(client_store, None, 100, "s1").await?;
+        let (snap2, _) = put_snapshot(server_store, Some(snap1), 100, "s2").await?;
+        let (snap2_client, _) = put_snapshot(client_store, Some(snap1_client), 100, "s2").await?;
+        assert_eq!(snap2, snap2_client);
+
+        // New snapshot only on the server
+        let (snap3, snap3_blocks) = put_snapshot(server_store, Some(snap2), 10, "s3").await?;
+
+        let client_config = &Config {
+            complete_subgraph_roots: HashSet::from([snap2]),
+            ..Config::default()
+        };
+        let server_config = &Config {
+            bloom_implies_complete_subgraphs: true,
+            ..Config::default()
+        };
+
+        let mut rounds = 0;
+        let mut blocks_transferred = 0;
+        let mut request = pull::request(snap3, None, client_config, client_store, &NoCache).await?;
+        while !request.indicates_finished() {
+            rounds += 1;
+            let response =
+                pull::response(snap3, request, server_config, server_store, NoCache).await?;
+            blocks_transferred += count_car_blocks(&response).await?;
+            request =
+                pull::request(snap3, Some(response), client_config, client_store, &NoCache).await?;
+        }
+
+        assert_eq!(rounds, 1, "delta pull should complete in a single round");
+        assert_eq!(
+            blocks_transferred, snap3_blocks,
+            "only the new snapshot's blocks should be transferred"
+        );
+        assert_complete_dag(snap3, client_store).await?;
+
+        Ok(())
+    }
+
+    /// Push of a new snapshot when the server already has the full history
+    /// (pinned roots as boundary): the server never asks for blocks below the
+    /// boundary, and the transfer converges with the full DAG on the server.
+    #[test_log::test(async_std::test)]
+    async fn test_push_boundary_never_requests_history() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+        let client_store = &MemoryBlockStore::new();
+
+        // Shared history
+        let (snap1, _) = put_snapshot(server_store, None, 100, "s1").await?;
+        let (snap1_client, _) = put_snapshot(client_store, None, 100, "s1").await?;
+        assert_eq!(snap1, snap1_client);
+
+        // History-only CIDs (for asserting the server never requests them)
+        let history_cids: HashSet<Cid> = DagWalk::breadth_first([snap1])
+            .stream(server_store, &NoCache)
+            .and_then(|item| async move { item.to_cid() })
+            .try_collect()
+            .await?;
+
+        // New snapshot only on the client
+        let (snap2, _) = put_snapshot(client_store, Some(snap1_client), 10, "s2").await?;
+
+        // Server treats its pinned root as complete boundary
+        let server_config = &Config {
+            complete_subgraph_roots: HashSet::from([snap1]),
+            ..Config::default()
+        };
+        let client_config = &Config::default();
+
+        let mut last_response = None;
+        loop {
+            let car =
+                push::request(snap2, last_response, client_config, client_store, &NoCache).await?;
+            let response = push::response(snap2, car, server_config, server_store, NoCache).await?;
+
+            for requested in &response.subgraph_roots {
+                assert!(
+                    !history_cids.contains(requested),
+                    "server requested history block {requested} despite boundary"
+                );
+            }
+
+            if response.indicates_finished() {
+                break;
+            }
+            last_response = Some(response);
+        }
+
+        assert_complete_dag(snap2, server_store).await?;
+
+        Ok(())
+    }
+
+    /// A boundary must not break cold transfers (client has nothing at all):
+    /// the server pruning flag is on, but the client sends no bloom, so
+    /// everything is transferred as usual.
+    #[test_log::test(async_std::test)]
+    async fn test_pull_cold_transfer_with_pruning_enabled() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+        let client_store = &MemoryBlockStore::new();
+
+        let (snap1, _) = put_snapshot(server_store, None, 50, "s1").await?;
+        let (snap2, _) = put_snapshot(server_store, Some(snap1), 50, "s2").await?;
+
+        let server_config = &Config {
+            bloom_implies_complete_subgraphs: true,
+            ..Config::default()
+        };
+        let client_config = &Config::default();
+
+        let mut request = pull::request(snap2, None, client_config, client_store, &NoCache).await?;
+        while !request.indicates_finished() {
+            let response =
+                pull::response(snap2, request, server_config, server_store, NoCache).await?;
+            request =
+                pull::request(snap2, Some(response), client_config, client_store, &NoCache).await?;
+        }
+
+        assert_complete_dag(snap2, client_store).await?;
 
         Ok(())
     }

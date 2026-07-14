@@ -1,7 +1,6 @@
 use crate::{
     cache::Cache,
     common::{self, ReceiverState},
-    dag_walk::{DagWalk, TraversedItem},
     error::{Error, IncrementalVerificationError},
 };
 use bytes::Bytes;
@@ -10,7 +9,10 @@ use libipld_core::{
     cid::Cid,
     multihash::{Code, MultihashDigest},
 };
-use std::{collections::HashSet, matches};
+use std::{
+    collections::{HashSet, VecDeque},
+    matches,
+};
 use wnfs_common::BlockStore;
 
 /// A data structure that keeps state about incremental DAG verification.
@@ -19,6 +21,9 @@ pub struct IncrementalDagVerification {
     /// All the CIDs that have been discovered to be missing from the DAG.
     pub want_cids: HashSet<Cid>,
     /// All the CIDs that are available locally.
+    ///
+    /// Note: CIDs seeded via [`Self::new_with_boundary`] stand for their whole
+    /// subgraph — traversal never descends below a CID that's already in here.
     pub have_cids: HashSet<Cid>,
 }
 
@@ -43,9 +48,33 @@ impl IncrementalDagVerification {
         store: &impl BlockStore,
         cache: &impl Cache,
     ) -> Result<Self, Error> {
+        Self::new_with_boundary(roots, HashSet::new(), store, cache).await
+    }
+
+    /// Like [`Self::new`], but with a set of "complete boundary" roots:
+    /// CIDs whose subgraphs the caller asserts to be completely present
+    /// locally (application invariant, e.g. wovin snapshot roots which are
+    /// only ever recorded/pinned as complete DAGs).
+    ///
+    /// They are seeded directly into `have_cids`, so they show up in the
+    /// resulting receiver-state bloom immediately (round 1), and traversals
+    /// stop at them instead of walking the entire history below — making
+    /// verification cost proportional to the *new* data, not the full DAG.
+    pub async fn new_with_boundary(
+        roots: impl IntoIterator<Item = Cid>,
+        complete_boundary: HashSet<Cid>,
+        store: &impl BlockStore,
+        cache: &impl Cache,
+    ) -> Result<Self, Error> {
+        let have_cids = complete_boundary;
+        let want_cids = roots
+            .into_iter()
+            .filter(|root| !have_cids.contains(root))
+            .collect();
+
         let mut this = Self {
-            want_cids: roots.into_iter().collect(),
-            have_cids: HashSet::new(),
+            want_cids,
+            have_cids,
         };
 
         this.update_have_cids(store, cache).await?;
@@ -62,25 +91,54 @@ impl IncrementalDagVerification {
         store: &impl BlockStore,
         cache: &impl Cache,
     ) -> Result<(), Error> {
-        let mut dag_walk = DagWalk::breadth_first(self.want_cids.iter().cloned());
-
-        while let Some(item) = dag_walk.next(store, cache).await? {
-            match item {
-                TraversedItem::Have(cid) => {
-                    self.mark_as_have(cid);
-                }
-                TraversedItem::Missing(cid) => {
-                    tracing::trace!(%cid, "Missing block, adding to want list");
-                    self.mark_as_want(cid);
-                }
-            }
-        }
+        // Re-examine all current wants (they may have appeared in the store).
+        let seeds: Vec<Cid> = self.want_cids.drain().collect();
+        self.discover(seeds, store, cache).await?;
 
         tracing::debug!(
             num_want = self.want_cids.len(),
             num_have = self.have_cids.len(),
             "Finished dag verification"
         );
+
+        Ok(())
+    }
+
+    /// BFS from the given seeds, classifying each newly-encountered CID as
+    /// "have" (present locally, links followed) or "want" (missing, frontier).
+    /// CIDs already classified are skipped (this is also what stops traversal
+    /// at boundary roots seeded by [`Self::new_with_boundary`]) — so across a
+    /// whole transfer each CID is visited at most once (amortized linear),
+    /// instead of re-walking the DAG per block.
+    async fn discover(
+        &mut self,
+        seeds: impl IntoIterator<Item = Cid>,
+        store: &impl BlockStore,
+        cache: &impl Cache,
+    ) -> Result<(), Error> {
+        let mut queue: VecDeque<Cid> = seeds.into_iter().collect();
+
+        while let Some(cid) = queue.pop_front() {
+            if self.have_cids.contains(&cid) || self.want_cids.contains(&cid) {
+                continue;
+            }
+
+            if store
+                .has_block(&cid)
+                .await
+                .map_err(Error::BlockStoreError)?
+            {
+                self.mark_as_have(cid);
+                let refs = cache
+                    .references(cid, store)
+                    .await
+                    .map_err(Error::BlockStoreError)?;
+                queue.extend(refs);
+            } else {
+                tracing::trace!(%cid, "Missing block, adding to want list");
+                self.mark_as_want(cid);
+            }
+        }
 
         Ok(())
     }
@@ -128,7 +186,7 @@ impl IncrementalDagVerification {
         &mut self,
         block: (Cid, Bytes),
         store: &impl BlockStore,
-        _cache: &impl Cache,
+        cache: &impl Cache,
     ) -> Result<(), Error> {
         let (cid, bytes) = block;
 
@@ -163,18 +221,14 @@ impl IncrementalDagVerification {
             .await
             .map_err(Error::BlockStoreError)?;
 
-        // Incrementally update state: mark this CID as "have" and add
-        // its direct links as "want" (if not already known).
-        // This is O(links_in_block) per block instead of a full DAG walk.
-        self.want_cids.remove(&cid);
-        self.have_cids.insert(cid);
+        // Incrementally update state: mark this CID as "have" and classify its
+        // direct links via `discover` (which stops at boundary roots and skips
+        // already-classified CIDs). Amortized O(links) per block instead of a
+        // full DAG walk per block.
+        self.mark_as_have(cid);
 
         let refs = common::references(cid, &bytes, Vec::new()).map_err(Error::ParsingError)?;
-        for ref_cid in refs {
-            if !self.have_cids.contains(&ref_cid) {
-                self.want_cids.insert(ref_cid);
-            }
-        }
+        self.discover(refs, store, cache).await?;
 
         Ok(())
     }

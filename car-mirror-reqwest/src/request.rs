@@ -220,7 +220,12 @@ where
             .await?
             .error_for_status()?;
 
-        let stream = StreamReader::new(answer.bytes_stream().map_err(std::io::Error::other));
+        // Note: std::io::Error::other would be nicer, but is only stable since Rust 1.74 (MSRV 1.66)
+        let stream = StreamReader::new(
+            answer
+                .bytes_stream()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+        );
 
         pull_request =
             car_mirror::pull::handle_response_streaming(root, stream, config, store, cache).await?;

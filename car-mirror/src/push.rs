@@ -2,8 +2,8 @@ use crate::{
     cache::Cache,
     common::{
         block_receive, block_receive_car_stream, block_receive_car_stream_with_blocks,
-        block_receive_with_blocks, block_send, block_send_block_stream, stream_car_frames,
-        CarFile, CarStream, Config, ReceiverState,
+        block_receive_with_blocks, block_send, block_send_block_stream, stream_car_frames, CarFile,
+        CarStream, Config, ReceiverState,
     },
     error::Error,
     messages::PushResponse,
@@ -314,8 +314,7 @@ mod tests {
             if response.indicates_finished() {
                 break;
             }
-            car_file =
-                push::request(root, Some(response), config, client_store, &NoCache).await?;
+            car_file = push::request(root, Some(response), config, client_store, &NoCache).await?;
         }
 
         // Verify complete transfer
