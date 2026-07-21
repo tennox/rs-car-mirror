@@ -462,6 +462,49 @@ pub async fn stream_car_frames(mut blocks: BlockStream<'_>) -> Result<CarStream<
     ))
 }
 
+/// Like [`stream_car_frames`], but stops once the emitted block frames would
+/// exceed `size_limit` bytes — the streaming equivalent of the per-round
+/// `receive_maximum` budget that [`write_blocks_into_car`] enforces.
+///
+/// The first block is always emitted (a CAR must contain at least its root
+/// block, mirroring [`write_blocks_into_car`]); subsequent blocks are included
+/// only while the running frame total stays under the limit. `None` streams the
+/// whole block stream with no cap.
+pub async fn stream_car_frames_limited(
+    mut blocks: BlockStream<'_>,
+    size_limit: Option<usize>,
+) -> Result<CarStream<'_>, Error> {
+    let Some((cid, block)) = blocks.try_next().await? else {
+        tracing::debug!("No blocks to write.");
+        return Ok(boxed_stream(futures::stream::empty()));
+    };
+
+    let mut writer = CarWriter::new(CarHeader::new_v1(vec![cid]), Vec::new());
+    writer.write_header().await?;
+    let first_frame = car_frame_from_block((cid, block)).await?;
+    let header = writer.finish().await?;
+
+    let stream = async_stream::try_stream! {
+        // Account for the frames we've already committed to (header + first block).
+        let mut emitted_bytes = header.len() + first_frame.len();
+        yield Bytes::from(header);
+        yield first_frame;
+
+        while let Some((cid, block)) = blocks.try_next().await? {
+            let frame = car_frame_from_block((cid, block)).await?;
+            if let Some(limit) = size_limit {
+                if emitted_bytes + frame.len() > limit {
+                    tracing::debug!(%cid, limit, emitted_bytes, frame_len = frame.len(), "stopping CAR stream at receive limit");
+                    break;
+                }
+            }
+            emitted_bytes += frame.len();
+            yield frame;
+        }
+    };
+    Ok(boxed_stream(stream))
+}
+
 /// Find all CIDs that a block references.
 ///
 /// This will error out if

@@ -2,7 +2,8 @@ use crate::{
     cache::Cache,
     common::{
         block_receive, block_receive_car_stream, block_receive_car_stream_with_blocks,
-        block_receive_with_blocks, block_send, block_send_block_stream, stream_car_frames, CarFile,
+        block_receive_with_blocks, block_send, block_send_block_stream,
+        block_send_block_stream_pruning, stream_car_frames, stream_car_frames_limited, CarFile,
         CarStream, Config, ReceiverState,
     },
     error::Error,
@@ -111,6 +112,31 @@ pub async fn response_streaming<'a>(
     Ok(car_stream)
 }
 
+/// Like [`response_streaming`], but honors [`Config`]: applies bloom-based
+/// subtree pruning (`bloom_implies_complete_subgraphs`) and caps the streamed
+/// frames at `receive_maximum`, matching the semantics of the buffered
+/// [`response`] path exactly — but emitting CAR frames as the DAG walk yields
+/// blocks instead of buffering the whole CAR first. This drops server
+/// time-to-first-byte from "full cold DAG assembly" to "first block", which is
+/// what makes large cold pulls survive a client read-timeout.
+pub async fn response_streaming_with_config<'a>(
+    root: Cid,
+    request: PullRequest,
+    config: &Config,
+    store: impl BlockStore + 'a,
+    cache: impl Cache + 'a,
+) -> Result<CarStream<'a>, Error> {
+    let block_stream = block_send_block_stream_pruning(
+        root,
+        Some(request.into()),
+        config.bloom_implies_complete_subgraphs,
+        store,
+        cache,
+    )
+    .await?;
+    stream_car_frames_limited(block_stream, Some(config.receive_maximum)).await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -210,6 +236,64 @@ mod tests {
             .await?;
         }
 
+        Ok(())
+    }
+
+    #[test_log::test(async_std::test)]
+    async fn test_streaming_transfer_with_config() -> TestResult {
+        // Config-respecting streaming response must complete a full transfer even
+        // when the per-round `receive_maximum` forces multiple rounds, and with
+        // bloom subtree pruning enabled (the proxy's real settings).
+        let client_store = MemoryBlockStore::new();
+        let client_cache = InMemoryCache::new(100_000);
+        let server_cache = InMemoryCache::new(100_000);
+        let (root, ref server_store) = setup_random_dag(256, 10 * 1024).await?;
+
+        // Small receive_maximum forces several streamed rounds, exercising the
+        // frame-size cap in `stream_car_frames_limited`. Bloom pruning left at the
+        // sound default (its `=true` soundness is tracked separately).
+        let config = Config {
+            receive_maximum: 30 * 1024,
+            ..Config::default()
+        };
+
+        let mut request = pull::request(root, None, &config, &client_store, &client_cache).await?;
+        let mut rounds = 0;
+        while !request.indicates_finished() {
+            rounds += 1;
+            assert!(rounds < 1000, "transfer failed to converge");
+            let car_stream = pull::response_streaming_with_config(
+                root,
+                request,
+                &config,
+                server_store,
+                &server_cache,
+            )
+            .await?;
+            let byte_stream = StreamReader::new(
+                car_stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+            );
+            request = pull::handle_response_streaming(
+                root,
+                byte_stream,
+                &config,
+                &client_store,
+                &client_cache,
+            )
+            .await?;
+        }
+
+        let client_cids = DagWalk::breadth_first([root])
+            .stream(&client_store, &NoCache)
+            .and_then(|item| async move { item.to_cid() })
+            .try_collect::<HashSet<_>>()
+            .await?;
+        let server_cids = DagWalk::breadth_first([root])
+            .stream(server_store, &NoCache)
+            .and_then(|item| async move { item.to_cid() })
+            .try_collect::<HashSet<_>>()
+            .await?;
+        assert_eq!(client_cids, server_cids);
         Ok(())
     }
 
