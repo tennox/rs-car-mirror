@@ -6,7 +6,7 @@ use crate::{
     incremental_verification::{BlockState, IncrementalDagVerification},
     messages::{PullRequest, PushResponse},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use deterministic_bloom::runtime_size::BloomFilter;
 use futures::{StreamExt, TryStreamExt};
 use iroh_car::{CarHeader, CarReader, CarWriter};
@@ -462,6 +462,14 @@ pub async fn stream_car_frames(mut blocks: BlockStream<'_>) -> Result<CarStream<
     ))
 }
 
+/// Target size for coalescing CAR block frames before yielding them downstream.
+///
+/// One `Bytes` per block turns into one transport write / TLS record per block;
+/// batching frames up to this many bytes amortizes that overhead across a whole
+/// chunk. 64 KiB is large enough to make the per-write cost negligible yet small
+/// enough that time-to-first-byte and memory stay low.
+const CAR_STREAM_CHUNK_SIZE: usize = 64 * 1024;
+
 /// Like [`stream_car_frames`], but stops once the emitted block frames would
 /// exceed `size_limit` bytes — the streaming equivalent of the per-round
 /// `receive_maximum` budget that [`write_blocks_into_car`] enforces.
@@ -485,10 +493,20 @@ pub async fn stream_car_frames_limited(
     let header = writer.finish().await?;
 
     let stream = async_stream::try_stream! {
-        // Account for the frames we've already committed to (header + first block).
+        // Coalesce many small block frames into ~CAR_STREAM_CHUNK_SIZE chunks
+        // before yielding. Emitting one `Bytes` per block means one downstream
+        // write / TLS record per block (Rocket `ByteStream` → hyper); for a
+        // large pull that's tens of thousands of sub-KiB writes whose per-write
+        // overhead dominates once the block bytes are served from cache. A CAR
+        // is a header followed by concatenated frames, so chunk boundaries are
+        // invisible to the reader — only the concatenation matters.
+        //
+        // `emitted_bytes` still counts *frame* bytes (not chunk boundaries) so
+        // the `receive_maximum` budget is enforced exactly as before.
         let mut emitted_bytes = header.len() + first_frame.len();
-        yield Bytes::from(header);
-        yield first_frame;
+        let mut buf = BytesMut::with_capacity(CAR_STREAM_CHUNK_SIZE);
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&first_frame);
 
         while let Some((cid, block)) = blocks.try_next().await? {
             let frame = car_frame_from_block((cid, block)).await?;
@@ -499,7 +517,19 @@ pub async fn stream_car_frames_limited(
                 }
             }
             emitted_bytes += frame.len();
-            yield frame;
+            buf.extend_from_slice(&frame);
+            if buf.len() >= CAR_STREAM_CHUNK_SIZE {
+                // Flush the full chunk and start a fresh buffer; TTFB is
+                // unaffected in practice (a 64 KiB chunk fills within a few
+                // hundred blocks of the walk).
+                let chunk = std::mem::replace(&mut buf, BytesMut::with_capacity(CAR_STREAM_CHUNK_SIZE));
+                yield chunk.freeze();
+            }
+        }
+
+        // Flush the trailing partial chunk (also covers the size-limit break).
+        if !buf.is_empty() {
+            yield buf.freeze();
         }
     };
     Ok(boxed_stream(stream))
