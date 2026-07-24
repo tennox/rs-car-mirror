@@ -610,6 +610,47 @@ fn handle_missing_bloom(have_cids_bloom: Option<BloomFilter>) -> BloomFilter {
     have_cids_bloom.unwrap_or_else(|| BloomFilter::new_with(1, Box::new([0]))) // An empty bloom that contains nothing
 }
 
+/// How many block reads to keep in flight while materializing one BFS level.
+///
+/// Every block in a level is independent — by the time a level is emitted the
+/// receiver already wants all of it (each was discovered from its parent in the
+/// previous level), so within-level reads can overlap freely. This bounds the
+/// in-flight reads (fd / memory / blocking-pool pressure) while letting the
+/// per-read syscall+threadpool cost of a disk-backed store (e.g. kubo flatfs,
+/// where a single serialized `tokio::fs::read` per block is ~200µs of overhead
+/// even when the data is page-cache-hot) overlap instead of summing.
+const LEVEL_READ_CONCURRENCY: usize = 64;
+
+/// Stream the blocks to send by walking the DAG **breadth-first, one level at a
+/// time**, reading each level's blocks concurrently.
+///
+/// For the default (`prune_bloom_subgraphs == false`) path this is
+/// behaviourally equivalent to a plain breadth-first `DagWalk` — same set of
+/// blocks, same bloom-skip / subgraph-root semantics, same parent-before-child
+/// (topological) emission order the receiver requires — but instead of one
+/// serialized `get_block().await` per block it reads a whole level with bounded
+/// concurrency. That's what turns a cold, disk-bound pull from "sum of per-block
+/// read latencies" into "level count × one parallel read batch".
+///
+/// Two intentional, self-healing divergences from the old walk (both in the
+/// more-lenient direction, neither reachable on the production path):
+///   - Under `prune_bloom_subgraphs == true`, a block reachable *both* through a
+///     pruned bloom-hit parent and through a live parent (a shared cross-edge
+///     leaf) may be emitted here where the old frontier-pruning dropped it. The
+///     receiver already has it under the complete-subgraph invariant, so it
+///     responds `Have` and the round converges — no stall.
+///   - A bloom-*skipped* block that is missing from the store no longer errors
+///     as `CIDNotFound` (the old walk error'd before the skip check). This only
+///     arises with a dangling reference in an inconsistent store; we simply
+///     don't read a block we weren't going to send. Blocks we *do* send still
+///     error as `CIDNotFound` when absent (see below).
+///
+/// The one read that a block needs serves two purposes at once: its bytes (for
+/// blocks we actually send) and its links (to form the next level). Crucially,
+/// a bloom-skipped block whose references are already cached costs **zero
+/// reads** — it expands purely from the references cache — so warm incremental
+/// pulls (where almost every walked block is skipped) still read only the few
+/// blocks they send, exactly as before.
 fn stream_blocks_from_roots<'a>(
     subgraph_roots: Vec<Cid>,
     bloom: BloomFilter,
@@ -618,25 +659,105 @@ fn stream_blocks_from_roots<'a>(
     cache: impl Cache + 'a,
 ) -> BlockStream<'a> {
     let subgraph_roots_set: HashSet<Cid> = subgraph_roots.iter().cloned().collect();
+    // Raw blocks carry no links; like `Cache::references` we never read or cache
+    // them for reference extraction.
+    let raw_codec: u64 = IpldCodec::Raw.into();
     Box::pin(async_stream::try_stream! {
-        let mut dag_walk = DagWalk::breadth_first(subgraph_roots.clone());
+        let mut visited: HashSet<Cid> = HashSet::new();
+        let mut level: Vec<Cid> = Vec::new();
+        for cid in subgraph_roots {
+            if visited.insert(cid) {
+                level.push(cid);
+            }
+        }
 
-        while let Some(item) = dag_walk.next(&store, &cache).await? {
-            let cid = item.to_cid()?;
+        while !level.is_empty() {
+            let mut next_level: Vec<Cid> = Vec::new();
 
-            if should_block_be_skipped(&cid, &bloom, &subgraph_roots_set) {
-                if prune_bloom_subgraphs {
-                    // Receiver has this block, and with the complete-subgraph
-                    // invariant it has everything below it too — stop walking
-                    // (but never prune explicitly requested roots).
-                    prune_frontier_below(&mut dag_walk, cid, &subgraph_roots_set, &store, &cache).await?;
+            // Pass 1 — classify the level without reading any blocks. A block
+            // needs a read only if we must send it, or if we must walk through
+            // it but its links aren't cached. Skipped blocks with cached links
+            // (the warm incremental case) expand here for free.
+            let mut to_read: Vec<(Cid, bool)> = Vec::new(); // (cid, emit?)
+            for &cid in &level {
+                let skipped = should_block_be_skipped(&cid, &bloom, &subgraph_roots_set);
+                if !skipped {
+                    // Must read to send; links come from the bytes (or cache) in pass 2.
+                    to_read.push((cid, true));
+                    continue;
                 }
-                continue;
+                // Skipped (receiver has it). With the complete-subgraph
+                // invariant we prune here and never descend; a raw block has no
+                // subgraph to descend into either. Otherwise walk through it —
+                // from cached links if we can, else read for links.
+                if prune_bloom_subgraphs || cid.codec() == raw_codec {
+                    continue;
+                }
+                match cache
+                    .get_references_cache(cid)
+                    .await
+                    .map_err(Error::BlockStoreError)?
+                {
+                    Some(refs) => {
+                        for r in refs {
+                            if visited.insert(r) {
+                                next_level.push(r);
+                            }
+                        }
+                    }
+                    None => to_read.push((cid, false)),
+                }
+            }
+            level.clear();
+
+            // Pass 2 — read the needed blocks with bounded concurrency
+            // (`buffered` preserves order → deterministic BFS emission). Each
+            // read block expands the frontier (from cached links or by parsing
+            // the bytes we just read, populating the cache) and is emitted if we
+            // were sending it. A block we need to send but that's absent surfaces
+            // as `CIDNotFound` here (as the plain walk's `Missing` → `to_cid()?`
+            // did); only bloom-skipped absent blocks are tolerated (see above).
+            let mut reads = futures::stream::iter(to_read.into_iter())
+                .map(|(cid, emit)| {
+                    let store = &store;
+                    async move {
+                        let bytes =
+                            store.get_block(&cid).await.map_err(Error::BlockStoreError)?;
+                        Ok::<_, Error>((cid, bytes, emit))
+                    }
+                })
+                .buffered(LEVEL_READ_CONCURRENCY);
+
+            while let Some((cid, bytes, emit)) = reads.try_next().await? {
+                if cid.codec() != raw_codec {
+                    let refs = match cache
+                        .get_references_cache(cid)
+                        .await
+                        .map_err(Error::BlockStoreError)?
+                    {
+                        Some(refs) => refs,
+                        None => {
+                            let refs = references(cid, &bytes, Vec::new())
+                                .map_err(Error::ParsingError)?;
+                            cache
+                                .put_references_cache(cid, refs.clone())
+                                .await
+                                .map_err(Error::BlockStoreError)?;
+                            refs
+                        }
+                    };
+                    for r in refs {
+                        if visited.insert(r) {
+                            next_level.push(r);
+                        }
+                    }
+                }
+                if emit {
+                    yield (cid, bytes);
+                }
             }
 
-            let bytes = store.get_block(&cid).await.map_err(Error::BlockStoreError)?;
-
-            yield (cid, bytes);
+            level = next_level;
         }
     })
 }
