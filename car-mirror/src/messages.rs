@@ -23,6 +23,27 @@ pub struct PullRequest {
     #[serde(rename = "bb")]
     #[serde(with = "crate::serde_bloom_bytes")]
     pub bloom_bytes: Vec<u8>,
+
+    /// Roots whose entire subgraphs the sender should neither walk nor send.
+    ///
+    /// Reason-agnostic by design: the receiver may already have the complete
+    /// subgraph (e.g. a previously fully-synced snapshot root), or may simply
+    /// not want it (shallow/bounded sync). The sender doesn't need to know
+    /// which — the instruction is the same (cf. graphsync's `do-not-send-cids`).
+    ///
+    /// Unlike a `bloom_bytes` hit (which only ever means "I have this one
+    /// block" and thus can only skip single blocks), an entry here prunes the
+    /// sender's walk below it. Explicitly requested `resources` always bypass
+    /// this, so a wrong entry degrades to extra rounds, never a stall.
+    ///
+    /// Optional on the wire (absent = empty): old peers ignore it.
+    #[serde(
+        rename = "ss",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "crate::serde_cid_vec"
+    )]
+    pub skip_subgraph_roots: Vec<Cid>,
 }
 
 /// The response sent after the initial and subsequent push requests.
@@ -44,6 +65,17 @@ pub struct PushResponse {
     #[serde(rename = "bb")]
     #[serde(with = "crate::serde_bloom_bytes")]
     pub bloom_bytes: Vec<u8>,
+
+    /// Roots whose entire subgraphs the sender should neither walk nor send.
+    /// See [`PullRequest::skip_subgraph_roots`] — same semantics, with the
+    /// server as the receiving side of a push.
+    #[serde(
+        rename = "ss",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "crate::serde_cid_vec"
+    )]
+    pub skip_subgraph_roots: Vec<Cid>,
 }
 
 impl PushResponse {
@@ -157,6 +189,46 @@ mod test {
         assert_eq!(push_response, push_back);
 
         Ok(())
+    }
+
+    #[test_log::test(async_std::test)]
+    async fn test_skip_subgraph_roots_roundtrip_and_legacy_compat() -> TestResult {
+        use libipld_core::cid::Cid;
+        use std::str::FromStr;
+
+        let skip_root =
+            Cid::from_str("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad5lrm")?;
+
+        // Roundtrip: ss survives encode/decode on both message types
+        let mut pull: PullRequest = partial_receiver_state().await?.into();
+        pull.skip_subgraph_roots = vec![skip_root];
+        let pull_back = PullRequest::from_dag_cbor(pull.to_dag_cbor()?)?;
+        assert_eq!(pull_back.skip_subgraph_roots, vec![skip_root]);
+        assert_eq!(pull, pull_back);
+
+        let mut push: PushResponse = partial_receiver_state().await?.into();
+        push.skip_subgraph_roots = vec![skip_root];
+        let push_back = PushResponse::from_dag_cbor(push.to_dag_cbor()?)?;
+        assert_eq!(push_back.skip_subgraph_roots, vec![skip_root]);
+
+        // Legacy compat, decode direction: bytes WITHOUT the ss key (what an
+        // old peer sends) decode into an empty skip set. Simulate by encoding
+        // with an empty set — skip_serializing_if omits the key entirely.
+        let mut legacy: PullRequest = partial_receiver_state().await?.into();
+        legacy.skip_subgraph_roots = vec![];
+        let legacy_bytes = legacy.to_dag_cbor()?;
+        assert!(
+            !contains_subslice(&legacy_bytes, b"ss"),
+            "empty skip set must not appear on the wire (old-peer byte-compat)"
+        );
+        let decoded = PullRequest::from_dag_cbor(&legacy_bytes)?;
+        assert!(decoded.skip_subgraph_roots.is_empty());
+
+        Ok(())
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test_log::test(async_std::test)]

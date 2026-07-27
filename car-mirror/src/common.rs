@@ -61,17 +61,24 @@ pub struct Config {
     /// one order of magnitude under the number of elements. E.g. for 100_000 elements,
     /// a false positive probability of 1 in 1 million.
     pub bloom_fpr: fn(u64) -> f64,
-    /// Roots of subgraphs that are known to be *completely* present on the
-    /// block-receiving side (application invariant — e.g. wovin snapshot roots,
-    /// which are only ever recorded/pinned as complete DAGs).
+    /// Roots of subgraphs the receiving side does not need transferred —
+    /// either because it already holds them *completely* (application
+    /// invariant, e.g. wovin snapshot roots, which are only ever
+    /// recorded/pinned as complete DAGs) or because it deliberately doesn't
+    /// want them (shallow/bounded sync). Reason-agnostic by design.
     ///
-    /// Used during incremental verification: traversal stops at these CIDs
-    /// instead of walking the entire (append-only) history below them, making
-    /// verification cost proportional to the new data instead of the full DAG.
+    /// Effects when set on the block-receiving side:
+    /// - Local incremental verification stops at these CIDs instead of
+    ///   walking the entire history below them (cost proportional to new
+    ///   data, not the full DAG).
+    /// - They are sent to the block-sending side as
+    ///   [`skip_subgraph_roots`](crate::messages::PullRequest::skip_subgraph_roots)
+    ///   on every round's message, so the sender prunes its walk below them
+    ///   (old senders ignore the field).
     ///
     /// This is per-transfer state more than static configuration — clone the
     /// base config and fill this in per request. Empty by default (no effect).
-    pub complete_subgraph_roots: HashSet<Cid>,
+    pub skip_subgraph_roots: HashSet<Cid>,
     /// Assume that when the receiver's bloom filter contains a CID, the
     /// receiver has that block's *entire subgraph*, and prune the send-side
     /// traversal below it (instead of walking every block of shared history
@@ -95,7 +102,7 @@ impl Default for Config {
             max_block_size: 1_000_000,  // 1 MB
             max_roots_per_round: 1000,  // max. ~41KB of CIDs
             bloom_fpr: |num_of_elems| f64::min(0.001, 0.1 / num_of_elems as f64),
-            complete_subgraph_roots: HashSet::new(),
+            skip_subgraph_roots: HashSet::new(),
             bloom_implies_complete_subgraphs: false,
         }
     }
@@ -109,6 +116,11 @@ pub struct ReceiverState {
     pub missing_subgraph_roots: Vec<Cid>,
     /// An optional bloom filter of all CIDs below the root that the receiving end has.
     pub have_cids_bloom: Option<BloomFilter>,
+    /// Roots whose entire subgraphs the sender should neither walk nor send
+    /// (the receiver has them completely, or doesn't want them). Explicitly
+    /// requested `missing_subgraph_roots` always take precedence. See
+    /// [`PullRequest::skip_subgraph_roots`].
+    pub skip_subgraph_roots: Vec<Cid>,
 }
 
 /// Newtype around bytes that are supposed to represent a CAR file
@@ -203,32 +215,42 @@ pub async fn block_send_block_stream_pruning<'a>(
     let ReceiverState {
         missing_subgraph_roots,
         have_cids_bloom,
+        skip_subgraph_roots,
     } = last_state.unwrap_or(ReceiverState {
         missing_subgraph_roots: vec![root],
         have_cids_bloom: None,
+        skip_subgraph_roots: Vec::new(),
     });
 
     let bloom = handle_missing_bloom(have_cids_bloom);
+    let skip_roots: HashSet<Cid> = skip_subgraph_roots.into_iter().collect();
 
     // Verify that all missing subgraph roots are in the relevant DAG.
+    //
+    // Validation is deliberately decoupled from pruning: it runs on UNPRUNED
+    // reachability (via the references cache — no block bytes needed when
+    // warm), while bloom-skips and skip-root pruning apply only to the send
+    // stream below. Validating on the pruned walk is what caused the historic
+    // pull stall: from round 2 the root itself is a bloom hit, pruning there
+    // cut reachability, and every deeper requested root got dropped as
+    // "DAG-unrelated" — the server then served 0 blocks forever.
+    //
     // Short-circuit: if the only root requested is the DAG root itself,
     // it's trivially valid — skip the expensive full-DAG walk.
     let subgraph_roots = if missing_subgraph_roots == [root] {
         missing_subgraph_roots
     } else {
-        verify_missing_subgraph_roots(
-            root,
-            &missing_subgraph_roots,
-            &bloom,
-            prune_bloom_subgraphs,
-            &store,
-            &cache,
-        )
-        .await?
+        verify_missing_subgraph_roots(root, &missing_subgraph_roots, &store, &cache).await?
     };
 
-    let stream =
-        stream_blocks_from_roots(subgraph_roots, bloom, prune_bloom_subgraphs, store, cache);
+    let stream = stream_blocks_from_roots(
+        subgraph_roots,
+        bloom,
+        skip_roots,
+        prune_bloom_subgraphs,
+        store,
+        cache,
+    );
 
     Ok(Box::pin(stream))
 }
@@ -262,7 +284,7 @@ pub async fn block_receive(
         }
         None => IncrementalDagVerification::new_with_boundary(
             [root],
-            config.complete_subgraph_roots.clone(),
+            config.skip_subgraph_roots.clone(),
             &store,
             &cache,
         )
@@ -273,6 +295,7 @@ pub async fn block_receive(
     receiver_state
         .missing_subgraph_roots
         .truncate(config.max_roots_per_round);
+    attach_skip_roots(&mut receiver_state, config);
 
     Ok(receiver_state)
 }
@@ -310,7 +333,7 @@ pub async fn block_receive_block_stream(
     let max_block_size = config.max_block_size;
     let mut dag_verification = IncrementalDagVerification::new_with_boundary(
         [root],
-        config.complete_subgraph_roots.clone(),
+        config.skip_subgraph_roots.clone(),
         &store,
         &cache,
     )
@@ -362,7 +385,9 @@ pub async fn block_receive_block_stream(
     // No full DAG walk needed here — verify_and_store_block incrementally
     // updates want_cids/have_cids by extracting direct links from each block.
 
-    Ok(dag_verification.into_receiver_state(config.bloom_fpr))
+    let mut receiver_state = dag_verification.into_receiver_state(config.bloom_fpr);
+    attach_skip_roots(&mut receiver_state, config);
+    Ok(receiver_state)
 }
 
 /// Like [`block_receive`], but returns verified blocks instead of storing them.
@@ -396,7 +421,7 @@ pub async fn block_receive_with_blocks(
         }
         None => IncrementalDagVerification::new_with_boundary(
             [root],
-            config.complete_subgraph_roots.clone(),
+            config.skip_subgraph_roots.clone(),
             &buffered,
             &cache,
         )
@@ -407,6 +432,7 @@ pub async fn block_receive_with_blocks(
     receiver_state
         .missing_subgraph_roots
         .truncate(config.max_roots_per_round);
+    attach_skip_roots(&mut receiver_state, config);
 
     let blocks = buffered.into_blocks();
     Ok((receiver_state, blocks))
@@ -588,11 +614,16 @@ async fn car_frame_from_block(block: (Cid, Bytes)) -> Result<Bytes, Error> {
 
 /// Ensure that any requested subgraph roots are actually part
 /// of the DAG from the root.
+///
+/// Walks UNPRUNED reachability on purpose (see the call site in
+/// [`block_send_block_stream_pruning`]): pruning during validation is what
+/// made deeper requested roots unreachable and stalled transfers. Exits early
+/// once every requested root has been found, so on the common path (requested
+/// roots near the frontier of what the receiver has) this touches only the
+/// top of the DAG, served from the references cache.
 async fn verify_missing_subgraph_roots(
     root: Cid,
     missing_subgraph_roots: &[Cid],
-    bloom: &BloomFilter,
-    prune_bloom_subgraphs: bool,
     store: &impl BlockStore,
     cache: &impl Cache,
 ) -> Result<Vec<Cid>, Error> {
@@ -605,14 +636,9 @@ async fn verify_missing_subgraph_roots(
 
         if missing_set.contains(&cid) {
             subgraph_roots.push(cid);
-            continue;
-        }
-
-        // If the receiver has this block (bloom hit) and its subgraph is
-        // implied complete, don't walk below it — but never prune away CIDs
-        // the receiver explicitly asked for (they're always valid to request).
-        if prune_bloom_subgraphs && bloom.contains(&cid.to_bytes()) {
-            prune_frontier_below(&mut dag_walk, cid, &missing_set, store, cache).await?;
+            if subgraph_roots.len() == missing_set.len() {
+                break;
+            }
         }
     }
 
@@ -632,6 +658,15 @@ async fn verify_missing_subgraph_roots(
     }
 
     Ok(subgraph_roots)
+}
+
+/// Attach the receiver's configured skip roots to the outgoing state, so the
+/// (stateless) sender learns them on every round. Sorted for deterministic
+/// wire bytes.
+fn attach_skip_roots(receiver_state: &mut ReceiverState, config: &Config) {
+    let mut skips: Vec<Cid> = config.skip_subgraph_roots.iter().cloned().collect();
+    skips.sort();
+    receiver_state.skip_subgraph_roots = skips;
 }
 
 fn handle_missing_bloom(have_cids_bloom: Option<BloomFilter>) -> BloomFilter {
@@ -692,6 +727,7 @@ const LEVEL_READ_CONCURRENCY: usize = 64;
 fn stream_blocks_from_roots<'a>(
     subgraph_roots: Vec<Cid>,
     bloom: BloomFilter,
+    skip_roots: HashSet<Cid>,
     prune_bloom_subgraphs: bool,
     store: impl BlockStore + 'a,
     cache: impl Cache + 'a,
@@ -718,6 +754,15 @@ fn stream_blocks_from_roots<'a>(
             // (the warm incremental case) expand here for free.
             let mut to_read: Vec<(Cid, bool)> = Vec::new(); // (cid, emit?)
             for &cid in &level {
+                // Explicit skip root: the receiver declared it needs nothing
+                // below this CID (has it completely, or doesn't want it) —
+                // prune unconditionally: don't send, don't descend. Unlike a
+                // bloom hit this is an exact, receiver-asserted claim, so it
+                // needs no `prune_bloom_subgraphs` opt-in. Explicitly
+                // requested roots always win over a skip claim.
+                if skip_roots.contains(&cid) && !subgraph_roots_set.contains(&cid) {
+                    continue;
+                }
                 let skipped = should_block_be_skipped(&cid, &bloom, &subgraph_roots_set);
                 if !skipped {
                     // Must read to send; links come from the bytes (or cache) in pass 2.
@@ -798,30 +843,6 @@ fn stream_blocks_from_roots<'a>(
             level = next_level;
         }
     })
-}
-
-/// Remove `cid`'s direct references from the walk frontier (they were just
-/// enqueued by `dag_walk.next`), keeping any CIDs in `protected`.
-///
-/// Used when the receiver is known to have `cid`'s complete subgraph
-/// (see [`Config::bloom_implies_complete_subgraphs`]).
-async fn prune_frontier_below(
-    dag_walk: &mut DagWalk,
-    cid: Cid,
-    protected: &HashSet<Cid>,
-    store: &impl BlockStore,
-    cache: &impl Cache,
-) -> Result<(), Error> {
-    let refs: HashSet<Cid> = cache
-        .references(cid, store)
-        .await
-        .map_err(Error::BlockStoreError)?
-        .into_iter()
-        .collect();
-    dag_walk
-        .frontier
-        .retain(|c| protected.contains(c) || !refs.contains(c));
-    Ok(())
 }
 
 async fn write_blocks_into_car<W: tokio::io::AsyncWrite + Unpin + Send>(
@@ -911,11 +932,13 @@ impl From<PushResponse> for ReceiverState {
             subgraph_roots,
             bloom_hash_count: hash_count,
             bloom_bytes: bytes,
+            skip_subgraph_roots,
         } = push;
 
         Self {
             missing_subgraph_roots: subgraph_roots,
             have_cids_bloom: Self::bloom_deserialize(hash_count, bytes),
+            skip_subgraph_roots,
         }
     }
 }
@@ -926,11 +949,13 @@ impl From<PullRequest> for ReceiverState {
             resources,
             bloom_hash_count: hash_count,
             bloom_bytes: bytes,
+            skip_subgraph_roots,
         } = pull;
 
         Self {
             missing_subgraph_roots: resources,
             have_cids_bloom: Self::bloom_deserialize(hash_count, bytes),
+            skip_subgraph_roots,
         }
     }
 }
@@ -940,6 +965,7 @@ impl From<ReceiverState> for PushResponse {
         let ReceiverState {
             missing_subgraph_roots,
             have_cids_bloom,
+            skip_subgraph_roots,
         } = receiver_state;
 
         let (hash_count, bytes) = ReceiverState::bloom_serialize(have_cids_bloom);
@@ -948,6 +974,7 @@ impl From<ReceiverState> for PushResponse {
             subgraph_roots: missing_subgraph_roots,
             bloom_hash_count: hash_count,
             bloom_bytes: bytes,
+            skip_subgraph_roots,
         }
     }
 }
@@ -957,6 +984,7 @@ impl From<ReceiverState> for PullRequest {
         let ReceiverState {
             missing_subgraph_roots,
             have_cids_bloom,
+            skip_subgraph_roots,
         } = receiver_state;
 
         let (hash_count, bytes) = ReceiverState::bloom_serialize(have_cids_bloom);
@@ -965,6 +993,7 @@ impl From<ReceiverState> for PullRequest {
             resources: missing_subgraph_roots,
             bloom_hash_count: hash_count,
             bloom_bytes: bytes,
+            skip_subgraph_roots,
         }
     }
 }
@@ -1007,6 +1036,10 @@ impl std::fmt::Debug for ReceiverState {
                 &self.missing_subgraph_roots.len(),
             )
             .field("have_cids_bloom", &have_cids_bloom)
+            .field(
+                "skip_subgraph_roots.len() == ",
+                &self.skip_subgraph_roots.len(),
+            )
             .finish()
     }
 }
@@ -1046,6 +1079,7 @@ pub(crate) mod tests {
         let state = ReceiverState {
             have_cids_bloom: Some(BloomFilter::new_from_size(4096, 1000)),
             missing_subgraph_roots: vec![Cid::default(); 1000],
+            skip_subgraph_roots: vec![Cid::default(); 1000],
         };
 
         let debug_print = format!("{state:#?}");
@@ -1186,10 +1220,13 @@ mod wovin_chain_tests {
     }
 
     /// Pull of a new snapshot when the client already has the full history:
-    /// with the client seeding its boundary and the server pruning below
-    /// bloom hits, only the delta is transferred — in a single round.
+    /// the client's `skip_subgraph_roots` ride the wire and the server prunes
+    /// its walk there — only the delta is transferred, in a single round.
+    /// Crucially this needs NO `bloom_implies_complete_subgraphs` on the
+    /// server (that flag caused the historic round-2 stall): the server runs
+    /// a plain default config.
     #[test_log::test(async_std::test)]
-    async fn test_pull_boundary_transfers_only_delta() -> TestResult {
+    async fn test_pull_skip_roots_transfers_only_delta() -> TestResult {
         let server_store = &MemoryBlockStore::new();
         let client_store = &MemoryBlockStore::new();
 
@@ -1204,17 +1241,19 @@ mod wovin_chain_tests {
         let (snap3, snap3_blocks) = put_snapshot(server_store, Some(snap2), 10, "s3").await?;
 
         let client_config = &Config {
-            complete_subgraph_roots: HashSet::from([snap2]),
+            skip_subgraph_roots: HashSet::from([snap2]),
             ..Config::default()
         };
-        let server_config = &Config {
-            bloom_implies_complete_subgraphs: true,
-            ..Config::default()
-        };
+        let server_config = &Config::default();
 
         let mut rounds = 0;
         let mut blocks_transferred = 0;
         let mut request = pull::request(snap3, None, client_config, client_store, &NoCache).await?;
+        assert_eq!(
+            request.skip_subgraph_roots,
+            vec![snap2],
+            "round-1 request should carry the skip root on the wire"
+        );
         while !request.indicates_finished() {
             rounds += 1;
             let response =
@@ -1230,6 +1269,147 @@ mod wovin_chain_tests {
             "only the new snapshot's blocks should be transferred"
         );
         assert_complete_dag(snap3, client_store).await?;
+
+        Ok(())
+    }
+
+    /// Regression for the historic pull stall (proxy commit 707c13a): from
+    /// round 2 the client HAS the root block, so the root is a bloom hit /
+    /// skip candidate — validation must still reach the deeper requested
+    /// roots. A small per-round budget forces many rounds; the transfer must
+    /// converge and still never re-send pruned history.
+    #[test_log::test(async_std::test)]
+    async fn test_pull_skip_roots_multiround_converges_without_stall() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+        let client_store = &MemoryBlockStore::new();
+
+        let (snap1, _) = put_snapshot(server_store, None, 200, "s1").await?;
+        let (snap1_client, _) = put_snapshot(client_store, None, 200, "s1").await?;
+        assert_eq!(snap1, snap1_client);
+
+        // Large delta → several rounds at a small receive_maximum
+        let (snap2, snap2_blocks) = put_snapshot(server_store, Some(snap1), 300, "s2").await?;
+
+        let client_config = &Config {
+            skip_subgraph_roots: HashSet::from([snap1]),
+            receive_maximum: 16 * 1024,
+            ..Config::default()
+        };
+        let server_config = &Config {
+            receive_maximum: 16 * 1024,
+            ..Config::default()
+        };
+
+        let mut rounds = 0;
+        let mut blocks_transferred = 0;
+        let mut request = pull::request(snap2, None, client_config, client_store, &NoCache).await?;
+        while !request.indicates_finished() {
+            rounds += 1;
+            assert!(rounds < 200, "transfer failed to converge (stall)");
+            let response =
+                pull::response(snap2, request, server_config, server_store, NoCache).await?;
+            request = pull::request(
+                snap2,
+                Some(response.clone()),
+                client_config,
+                client_store,
+                &NoCache,
+            )
+            .await?;
+            blocks_transferred += count_car_blocks(&response).await?;
+        }
+
+        assert!(rounds > 1, "test should exercise the multi-round path");
+        assert_eq!(
+            blocks_transferred, snap2_blocks,
+            "history below the skip root must never be transferred"
+        );
+        assert_complete_dag(snap2, client_store).await?;
+
+        Ok(())
+    }
+
+    /// Explicitly requested roots always win over a skip claim: a client that
+    /// discovers a gap below a root it previously declared as skipped (wrong
+    /// claim, lost data, …) can still request the missing blocks — this is
+    /// the self-healing path.
+    #[test_log::test(async_std::test)]
+    async fn test_pull_explicit_request_bypasses_skip_roots() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+
+        let (snap1, _) = put_snapshot(server_store, None, 5, "s1").await?;
+        let (snap2, _) = put_snapshot(server_store, Some(snap1), 5, "s2").await?;
+
+        // A block deep below snap1 (which the request also declares skipped)
+        let deep_cid = {
+            let refs = NoCache.references(snap1, server_store).await?;
+            refs[0] // the applogs chunk under snap1
+        };
+
+        let request = PullRequest {
+            resources: vec![deep_cid],
+            bloom_hash_count: 3,
+            bloom_bytes: vec![],
+            skip_subgraph_roots: vec![snap1],
+        };
+
+        let response =
+            pull::response(snap2, request, &Config::default(), server_store, NoCache).await?;
+        let reader = CarReader::new(Cursor::new(response.bytes.clone())).await?;
+        let mut got = HashSet::new();
+        let mut stream = Box::pin(reader.stream());
+        while let Some((cid, _)) = stream.try_next().await? {
+            got.insert(cid);
+        }
+
+        assert!(
+            got.contains(&deep_cid),
+            "explicitly requested root below a skip root must still be served"
+        );
+
+        Ok(())
+    }
+
+    /// Shallow pull: the client has NOTHING and declares the previous
+    /// snapshot root as skipped because it doesn't WANT the history (bounded
+    /// sync). Only the new snapshot's own blocks arrive, the protocol
+    /// finishes cleanly, and the local DAG is intentionally incomplete below
+    /// the skip root.
+    #[test_log::test(async_std::test)]
+    async fn test_pull_shallow_skips_unwanted_history() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+        let client_store = &MemoryBlockStore::new();
+
+        let (snap1, _) = put_snapshot(server_store, None, 100, "s1").await?;
+        let (snap2, snap2_blocks) = put_snapshot(server_store, Some(snap1), 10, "s2").await?;
+
+        let client_config = &Config {
+            skip_subgraph_roots: HashSet::from([snap1]),
+            ..Config::default()
+        };
+        let server_config = &Config::default();
+
+        let mut rounds = 0;
+        let mut blocks_transferred = 0;
+        let mut request = pull::request(snap2, None, client_config, client_store, &NoCache).await?;
+        while !request.indicates_finished() {
+            rounds += 1;
+            assert!(rounds < 10, "shallow pull failed to converge");
+            let response =
+                pull::response(snap2, request, server_config, server_store, NoCache).await?;
+            blocks_transferred += count_car_blocks(&response).await?;
+            request =
+                pull::request(snap2, Some(response), client_config, client_store, &NoCache).await?;
+        }
+
+        assert_eq!(
+            blocks_transferred, snap2_blocks,
+            "only the new snapshot's own blocks should be transferred"
+        );
+        // The new snapshot's own blocks are present…
+        assert!(client_store.has_block(&snap2).await?);
+        // …but the skipped history is genuinely absent (shallow by intent).
+        assert!(!client_store.has_block(&snap1).await?);
 
         Ok(())
     }
@@ -1259,7 +1439,7 @@ mod wovin_chain_tests {
 
         // Server treats its pinned root as complete boundary
         let server_config = &Config {
-            complete_subgraph_roots: HashSet::from([snap1]),
+            skip_subgraph_roots: HashSet::from([snap1]),
             ..Config::default()
         };
         let client_config = &Config::default();

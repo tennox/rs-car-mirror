@@ -244,6 +244,7 @@ impl IncrementalDagVerification {
             return ReceiverState {
                 missing_subgraph_roots,
                 have_cids_bloom: None,
+                skip_subgraph_roots: Vec::new(),
             };
         }
 
@@ -252,6 +253,7 @@ impl IncrementalDagVerification {
             return ReceiverState {
                 missing_subgraph_roots,
                 have_cids_bloom: None,
+                skip_subgraph_roots: Vec::new(),
             };
         }
 
@@ -275,6 +277,7 @@ impl IncrementalDagVerification {
         ReceiverState {
             missing_subgraph_roots,
             have_cids_bloom: Some(bloom),
+            skip_subgraph_roots: Vec::new(),
         }
     }
 }

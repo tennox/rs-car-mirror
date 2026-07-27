@@ -162,6 +162,7 @@ pub async fn car_mirror_pull<B: BlockStore + Clone + 'static>(
             resources: vec![cid],
             bloom_hash_count: 3,
             bloom_bytes: vec![],
+            skip_subgraph_roots: vec![],
         })
     });
 
