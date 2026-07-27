@@ -330,10 +330,18 @@ pub async fn block_receive_block_stream(
 
         match read_and_verify_block(&mut dag_verification, (cid, block), &store, &cache).await? {
             BlockState::Have => {
-                // This can happen because we've just discovered a subgraph we already have.
-                // Let's update the endpoint with our new receiver state.
-                tracing::debug!(%cid, "Received block we already have, stopping transfer");
-                break;
+                // A single already-known CID does NOT imply the rest of the stream is
+                // redundant — `bloom_implies_complete_subgraphs` defaults to `false`
+                // precisely because a bloom hit only describes one flat block, not a
+                // complete subtree (see `Config` docs). Breaking here used to discard
+                // every remaining (already-downloaded!) block in the response, forcing
+                // near-total re-transfers on stores that share blocks across DAGs (e.g.
+                // a global content-addressed store deduping structural blocks across
+                // many unrelated roots) — one incidental hit early in the stream could
+                // throw away 100K+ blocks that were still wanted. Skip the duplicate and
+                // keep consuming; the receiver state built at the end of the stream
+                // already reflects everything actually seen.
+                tracing::trace!(%cid, "Received block we already have, skipping it");
             }
             BlockState::Unexpected => {
                 // We received a block out-of-order. This is weird, but can
