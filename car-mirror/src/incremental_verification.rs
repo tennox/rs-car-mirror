@@ -22,9 +22,22 @@ pub struct IncrementalDagVerification {
     pub want_cids: HashSet<Cid>,
     /// All the CIDs that are available locally.
     ///
-    /// Note: CIDs seeded via [`Self::new_with_boundary`] stand for their whole
-    /// subgraph — traversal never descends below a CID that's already in here.
+    /// This only ever contains CIDs actually walked/received during this
+    /// verification — boundary members (see [`Self::boundary`]) are tracked
+    /// separately and never end up in here, so blooms built from this set
+    /// stay proportional to the transfer delta, not the boundary size.
     pub have_cids: HashSet<Cid>,
+    /// The complete-subgraph boundary: CIDs whose subgraphs the caller asserts
+    /// to be completely present locally. Traversal never descends below a
+    /// member; membership is only *checked* (this set may be huge — e.g. every
+    /// pinned snapshot root on a server) and is never copied into
+    /// [`Self::have_cids`] nor into the receiver-state bloom.
+    pub boundary: HashSet<Cid>,
+    /// The subset of [`Self::boundary`] that was actually encountered during
+    /// traversal. These are the only boundary members relevant to the current
+    /// transfer, and the only ones that go on the wire (as
+    /// `skip_subgraph_roots` in the receiver state).
+    pub boundary_hits: HashSet<Cid>,
 }
 
 /// The state of a block retrieval
@@ -56,25 +69,41 @@ impl IncrementalDagVerification {
     /// locally (application invariant, e.g. wovin snapshot roots which are
     /// only ever recorded/pinned as complete DAGs).
     ///
-    /// They are seeded directly into `have_cids`, so they show up in the
-    /// resulting receiver-state bloom immediately (round 1), and traversals
-    /// stop at them instead of walking the entire history below — making
-    /// verification cost proportional to the *new* data, not the full DAG.
+    /// The boundary is used purely as a membership check during traversal:
+    /// traversal stops at a member instead of walking the entire history
+    /// below it (making verification cost proportional to the *new* data,
+    /// not the full DAG), and the member is recorded in
+    /// [`Self::boundary_hits`]. The boundary is never seeded into
+    /// [`Self::have_cids`], so it never inflates the receiver-state bloom
+    /// nor the wire — only the (few) actually-hit members do.
+    ///
+    /// A root that is itself a boundary member is trivially complete: it's
+    /// recorded as a boundary hit, not a want.
     pub async fn new_with_boundary(
         roots: impl IntoIterator<Item = Cid>,
         complete_boundary: HashSet<Cid>,
         store: &impl BlockStore,
         cache: &impl Cache,
     ) -> Result<Self, Error> {
-        let have_cids = complete_boundary;
+        let boundary = complete_boundary;
+        let mut boundary_hits = HashSet::new();
         let want_cids = roots
             .into_iter()
-            .filter(|root| !have_cids.contains(root))
+            .filter(|root| {
+                if boundary.contains(root) {
+                    boundary_hits.insert(*root);
+                    false
+                } else {
+                    true
+                }
+            })
             .collect();
 
         let mut this = Self {
             want_cids,
-            have_cids,
+            have_cids: HashSet::new(),
+            boundary,
+            boundary_hits,
         };
 
         this.update_have_cids(store, cache).await?;
@@ -106,10 +135,10 @@ impl IncrementalDagVerification {
 
     /// BFS from the given seeds, classifying each newly-encountered CID as
     /// "have" (present locally, links followed) or "want" (missing, frontier).
-    /// CIDs already classified are skipped (this is also what stops traversal
-    /// at boundary roots seeded by [`Self::new_with_boundary`]) — so across a
-    /// whole transfer each CID is visited at most once (amortized linear),
-    /// instead of re-walking the DAG per block.
+    /// A boundary member is recorded as a boundary hit and never descended
+    /// into (nor added to have/want). CIDs already classified are skipped —
+    /// so across a whole transfer each CID is visited at most once (amortized
+    /// linear), instead of re-walking the DAG per block.
     async fn discover(
         &mut self,
         seeds: impl IntoIterator<Item = Cid>,
@@ -119,6 +148,11 @@ impl IncrementalDagVerification {
         let mut queue: VecDeque<Cid> = seeds.into_iter().collect();
 
         while let Some(cid) = queue.pop_front() {
+            if self.boundary.contains(&cid) {
+                self.boundary_hits.insert(cid);
+                continue;
+            }
+
             if self.have_cids.contains(&cid) || self.want_cids.contains(&cid) {
                 continue;
             }
@@ -163,7 +197,9 @@ impl IncrementalDagVerification {
     pub fn block_state(&self, cid: Cid) -> BlockState {
         if self.want_cids.contains(&cid) {
             BlockState::Want
-        } else if self.have_cids.contains(&cid) {
+        } else if self.have_cids.contains(&cid) || self.boundary.contains(&cid) {
+            // Boundary members count as "have": the receiver asserts it holds
+            // their complete subgraphs, so it doesn't want them re-sent.
             BlockState::Have
         } else {
             BlockState::Unexpected
@@ -234,9 +270,17 @@ impl IncrementalDagVerification {
     }
 
     /// Computes the receiver state for the current incremental dag verification state.
-    /// This takes the have CIDs and turns them into
+    ///
+    /// The `have_cids_bloom` is built over the walked/received CIDs only
+    /// (`have_cids`), so its size is proportional to the transfer delta.
+    /// The (sorted) boundary hits are returned as `skip_subgraph_roots`, so
+    /// the sender prunes its walk below exactly the boundary members that are
+    /// relevant to this transfer — never the whole (potentially huge) boundary.
     pub fn into_receiver_state(self, bloom_fpr: fn(u64) -> f64) -> ReceiverState {
-        let missing_subgraph_roots = self.want_cids.into_iter().collect();
+        let missing_subgraph_roots: Vec<Cid> = self.want_cids.into_iter().collect();
+
+        let mut skip_subgraph_roots: Vec<Cid> = self.boundary_hits.into_iter().collect();
+        skip_subgraph_roots.sort();
 
         let bloom_capacity = self.have_cids.len() as u64;
 
@@ -244,7 +288,7 @@ impl IncrementalDagVerification {
             return ReceiverState {
                 missing_subgraph_roots,
                 have_cids_bloom: None,
-                skip_subgraph_roots: Vec::new(),
+                skip_subgraph_roots,
             };
         }
 
@@ -253,7 +297,7 @@ impl IncrementalDagVerification {
             return ReceiverState {
                 missing_subgraph_roots,
                 have_cids_bloom: None,
-                skip_subgraph_roots: Vec::new(),
+                skip_subgraph_roots,
             };
         }
 
@@ -277,7 +321,7 @@ impl IncrementalDagVerification {
         ReceiverState {
             missing_subgraph_roots,
             have_cids_bloom: Some(bloom),
-            skip_subgraph_roots: Vec::new(),
+            skip_subgraph_roots,
         }
     }
 }

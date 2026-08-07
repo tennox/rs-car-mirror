@@ -79,6 +79,24 @@ pub struct Config {
     /// This is per-transfer state more than static configuration — clone the
     /// base config and fill this in per request. Empty by default (no effect).
     pub skip_subgraph_roots: HashSet<Cid>,
+    /// Verification-only complete-subgraph boundary for the block-receiving
+    /// side: roots the receiver knows it holds *completely* (application
+    /// invariant, e.g. every pinned wovin snapshot root on a server).
+    ///
+    /// Unlike [`skip_subgraph_roots`](Self::skip_subgraph_roots), this set may
+    /// be huge (hundreds of thousands of CIDs) because it is only ever
+    /// membership-checked during traversal:
+    /// - Incremental verification stops descending at a member and records it
+    ///   as a *boundary hit*.
+    /// - It is never pre-seeded into the verification's `have_cids`, so the
+    ///   receiver-state bloom stays sized by the blocks actually
+    ///   walked/received (O(delta)).
+    /// - It is never sent wholesale on the wire — only the actually-hit
+    ///   members ride along as `skip_subgraph_roots` in the outgoing message
+    ///   (for a typical delta push: exactly the previous snapshot root).
+    ///
+    /// Empty by default (no effect).
+    pub complete_boundary: HashSet<Cid>,
     /// Assume that when the receiver's bloom filter contains a CID, the
     /// receiver has that block's *entire subgraph*, and prune the send-side
     /// traversal below it (instead of walking every block of shared history
@@ -103,6 +121,7 @@ impl Default for Config {
             max_roots_per_round: 1000,  // max. ~41KB of CIDs
             bloom_fpr: |num_of_elems| f64::min(0.001, 0.1 / num_of_elems as f64),
             skip_subgraph_roots: HashSet::new(),
+            complete_boundary: HashSet::new(),
             bloom_implies_complete_subgraphs: false,
         }
     }
@@ -284,7 +303,7 @@ pub async fn block_receive(
         }
         None => IncrementalDagVerification::new_with_boundary(
             [root],
-            config.skip_subgraph_roots.clone(),
+            traversal_boundary(config),
             &store,
             &cache,
         )
@@ -333,7 +352,7 @@ pub async fn block_receive_block_stream(
     let max_block_size = config.max_block_size;
     let mut dag_verification = IncrementalDagVerification::new_with_boundary(
         [root],
-        config.skip_subgraph_roots.clone(),
+        traversal_boundary(config),
         &store,
         &cache,
     )
@@ -421,7 +440,7 @@ pub async fn block_receive_with_blocks(
         }
         None => IncrementalDagVerification::new_with_boundary(
             [root],
-            config.skip_subgraph_roots.clone(),
+            traversal_boundary(config),
             &buffered,
             &cache,
         )
@@ -660,11 +679,27 @@ async fn verify_missing_subgraph_roots(
     Ok(subgraph_roots)
 }
 
+/// The membership set at which the receiver's incremental verification stops
+/// descending: both the (small, always-advertised) `skip_subgraph_roots` and
+/// the (potentially huge, verification-only) `complete_boundary`.
+fn traversal_boundary(config: &Config) -> HashSet<Cid> {
+    config
+        .skip_subgraph_roots
+        .union(&config.complete_boundary)
+        .cloned()
+        .collect()
+}
+
 /// Attach the receiver's configured skip roots to the outgoing state, so the
-/// (stateless) sender learns them on every round. Sorted for deterministic
-/// wire bytes.
+/// (stateless) sender learns them on every round. The state's existing
+/// `skip_subgraph_roots` (the boundary hits recorded during verification) are
+/// kept — the result is the union `config.skip_subgraph_roots ∪ boundary_hits`,
+/// sorted & deduped for deterministic wire bytes. The (potentially huge)
+/// `complete_boundary` never goes on the wire wholesale.
 fn attach_skip_roots(receiver_state: &mut ReceiverState, config: &Config) {
-    let mut skips: Vec<Cid> = config.skip_subgraph_roots.iter().cloned().collect();
+    let mut skips: HashSet<Cid> = receiver_state.skip_subgraph_roots.iter().cloned().collect();
+    skips.extend(config.skip_subgraph_roots.iter().cloned());
+    let mut skips: Vec<Cid> = skips.into_iter().collect();
     skips.sort();
     receiver_state.skip_subgraph_roots = skips;
 }
@@ -1439,7 +1474,7 @@ mod wovin_chain_tests {
 
         // Server treats its pinned root as complete boundary
         let server_config = &Config {
-            skip_subgraph_roots: HashSet::from([snap1]),
+            complete_boundary: HashSet::from([snap1]),
             ..Config::default()
         };
         let client_config = &Config::default();
@@ -1464,6 +1499,169 @@ mod wovin_chain_tests {
         }
 
         assert_complete_dag(snap2, server_store).await?;
+
+        Ok(())
+    }
+
+    /// Generate `n` syntactically valid, deterministic CIDs that don't
+    /// correspond to any real blocks — used to simulate a server whose
+    /// complete boundary contains every pinned root (hundreds of thousands).
+    fn synthetic_cids(n: usize) -> HashSet<Cid> {
+        use libipld_core::multihash::{Code, MultihashDigest};
+        (0..n)
+            .map(|i| {
+                let hash = Code::Sha2_256.digest(format!("synthetic-boundary-{i}").as_bytes());
+                Cid::new_v1(DagCborCodec.into(), hash)
+            })
+            .collect()
+    }
+
+    /// The core scaling fix: a server with a HUGE `complete_boundary` (think
+    /// 583k pinned roots) must produce push responses that are O(delta) —
+    /// the wire `ss` contains ONLY the boundary roots actually hit by this
+    /// transfer's traversal (here: exactly `prev`), never the whole boundary,
+    /// and the serialized response stays tiny.
+    #[test_log::test(async_std::test)]
+    async fn test_push_large_boundary_response_is_delta_sized() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+        let client_store = &MemoryBlockStore::new();
+
+        // Shared history, present & "pinned" on the server
+        let (snap1, _) = put_snapshot(server_store, None, 100, "s1").await?;
+        let (snap1_client, _) = put_snapshot(client_store, None, 100, "s1").await?;
+        assert_eq!(snap1, snap1_client);
+
+        // New snapshot only on the client
+        let (snap2, _) = put_snapshot(client_store, Some(snap1_client), 10, "s2").await?;
+
+        // Server boundary: 10k synthetic pinned roots + the one relevant one
+        let mut boundary = synthetic_cids(10_000);
+        boundary.insert(snap1);
+        let server_config = &Config {
+            complete_boundary: boundary,
+            ..Config::default()
+        };
+        let client_config = &Config::default();
+
+        let mut last_response = None;
+        loop {
+            let car =
+                push::request(snap2, last_response, client_config, client_store, &NoCache).await?;
+            let response = push::response(snap2, car, server_config, server_store, NoCache).await?;
+
+            assert_eq!(
+                response.skip_subgraph_roots,
+                vec![snap1],
+                "wire ss must contain only the actually-hit boundary root"
+            );
+            let wire_bytes = response.to_dag_cbor()?;
+            assert!(
+                wire_bytes.len() < 2048,
+                "response must be O(delta), got {} bytes",
+                wire_bytes.len()
+            );
+
+            if response.indicates_finished() {
+                break;
+            }
+            last_response = Some(response);
+        }
+
+        assert_complete_dag(snap2, server_store).await?;
+
+        Ok(())
+    }
+
+    /// The have-bloom must be sized by the WALKED/RECEIVED set, not the
+    /// boundary: with a 10k-CID boundary and a small per-round budget (so a
+    /// mid-transfer, non-finished response actually carries a bloom), the
+    /// bloom stays well under a kilobyte instead of scaling with the boundary.
+    #[test_log::test(async_std::test)]
+    async fn test_push_bloom_sized_by_walked_set_not_boundary() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+        let client_store = &MemoryBlockStore::new();
+
+        let (snap1, _) = put_snapshot(server_store, None, 100, "s1").await?;
+        let (snap1_client, _) = put_snapshot(client_store, None, 100, "s1").await?;
+        assert_eq!(snap1, snap1_client);
+
+        // Large-ish delta + small round budget → guaranteed multi-round
+        let (snap2, _) = put_snapshot(client_store, Some(snap1_client), 300, "s2").await?;
+
+        let mut boundary = synthetic_cids(10_000);
+        boundary.insert(snap1);
+        // Budget must exceed the largest single block (the 300-link chunk is
+        // ~12 KB) but stay well below the full delta, forcing several rounds.
+        let server_config = &Config {
+            complete_boundary: boundary,
+            receive_maximum: 16 * 1024,
+            ..Config::default()
+        };
+        let client_config = &Config {
+            receive_maximum: 16 * 1024,
+            ..Config::default()
+        };
+
+        let mut saw_bloom = false;
+        let mut last_response = None;
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds < 200, "transfer failed to converge");
+            let car =
+                push::request(snap2, last_response, client_config, client_store, &NoCache).await?;
+            let response = push::response(snap2, car, server_config, server_store, NoCache).await?;
+
+            if !response.bloom_bytes.is_empty() {
+                saw_bloom = true;
+                // Delta is ~313 blocks → at most a 1 KiB power-of-two bloom.
+                // The old boundary-seeded sizing (10k+ elements) would produce
+                // a 32 KiB bloom here (and ~4 MB at production's 583k scale).
+                assert!(
+                    response.bloom_bytes.len() <= 1024,
+                    "bloom must be sized by the walked set (~delta), got {} bytes",
+                    response.bloom_bytes.len()
+                );
+            }
+
+            if response.indicates_finished() {
+                break;
+            }
+            last_response = Some(response);
+        }
+
+        assert!(saw_bloom, "test should exercise a bloom-carrying response");
+        assert_complete_dag(snap2, server_store).await?;
+
+        Ok(())
+    }
+
+    /// Regression for the `skip_subgraph_roots` / `complete_boundary` field
+    /// split: a pull client asserts its config skips on the wire in round 1,
+    /// BEFORE any blocks have been walked (the client store is completely
+    /// empty, so there are no boundary hits yet) — this is exactly why config
+    /// skips are attached unconditionally rather than derived from hits.
+    #[test_log::test(async_std::test)]
+    async fn test_pull_round1_carries_config_skips_before_any_walk() -> TestResult {
+        let server_store = &MemoryBlockStore::new();
+        let client_store = &MemoryBlockStore::new();
+
+        let (snap1, _) = put_snapshot(server_store, None, 5, "s1").await?;
+        let (snap2, _) = put_snapshot(server_store, Some(snap1), 5, "s2").await?;
+
+        let client_config = &Config {
+            skip_subgraph_roots: HashSet::from([snap1]),
+            ..Config::default()
+        };
+
+        let request = pull::request(snap2, None, client_config, client_store, &NoCache).await?;
+
+        assert_eq!(request.resources, vec![snap2]);
+        assert_eq!(
+            request.skip_subgraph_roots,
+            vec![snap1],
+            "round-1 request must carry the configured skip roots before any walk"
+        );
 
         Ok(())
     }
